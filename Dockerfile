@@ -14,7 +14,10 @@ FROM node:22-alpine AS production
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=3001
-ENV DATABASE_PATH=/app/data/liensina-db.json
+ENV DATABASE_PATH=/app/data/liensina.sqlite
+ENV JWT_ACCESS_EXPIRES_IN=30m
+ENV REFRESH_TOKEN_DAYS=7
+ENV REFRESH_TOKEN_REUSE_GRACE_SECONDS=15
 
 WORKDIR /app
 
@@ -29,4 +32,3 @@ USER node
 EXPOSE 3001
 
 CMD ["node", "dist/main.js"]
-

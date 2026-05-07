@@ -1,8 +1,19 @@
-﻿import { Body, Controller, Delete, Get, Param, Patch, Post, Req, UseGuards } from '@nestjs/common'
+import { BadRequestException, Body, Controller, Delete, Get, Param, Patch, Post, Query, Req, Res, UploadedFile, UseGuards, UseInterceptors, UnauthorizedException } from '@nestjs/common'
+import { FileInterceptor } from '@nestjs/platform-express'
+import type { Request, Response } from 'express'
 
 import { AuthGuard, type RequestWithUser } from './auth.guard'
 import { LiensinaService } from './liensina.service'
-import type { ClassRoom, Evaluation, Role, School, SchoolCalendarEvent, UserAccount } from './liensina.types'
+import type { ClassRoom, CreateMealFoodPayload, CreateMealItemPayload, CreateMealManagementPayload, CreateQuestionRequest, Evaluation, Guardian, Role, School, SchoolCalendarEvent, Student, Teacher, UpdateMealBudgetPayload, UpsertMealMenuPayload, UserAccount } from './liensina.types'
+
+type UploadedProfileImageFile = {
+  buffer: Buffer
+  originalname: string
+  mimetype: string
+  size: number
+}
+
+const refreshCookieName = 'liensina_refresh_token'
 
 @Controller()
 export class AppController {
@@ -10,18 +21,154 @@ export class AppController {
 
   @Get('health')
   health() {
-    return { status: 'ok', app: 'LiEnsina_Back_End', database: 'json', timestamp: new Date().toISOString() }
+    return { status: 'ok', app: 'LiEnsina_Back_End', database: 'sqlite', timestamp: new Date().toISOString() }
   }
 
   @Post('auth/login')
-  login(@Body() body: { email: string; password: string }) {
-    return this.liensinaService.login(body.email ?? '', body.password ?? '')
+  async login(
+    @Body() body: { email: string; password: string },
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const result = await this.liensinaService.login(body.email ?? '', body.password ?? '', this.getAuthContext(request))
+    this.setRefreshCookie(response, result.refreshToken, result.refreshExpiresAt)
+    const { refreshToken: _refreshToken, refreshExpiresAt: _refreshExpiresAt, ...publicResult } = result
+    return publicResult
+  }
+
+  @Post('auth/refresh')
+  async refresh(
+    @Body() body: { refreshToken?: string },
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const refreshToken = this.getRefreshToken(request, body)
+    if (!refreshToken) throw new UnauthorizedException('Refresh token ausente.')
+
+    const result = await this.liensinaService.refreshLogin(refreshToken, this.getAuthContext(request))
+    this.setRefreshCookie(response, result.refreshToken, result.refreshExpiresAt)
+    const { refreshToken: _refreshToken, refreshExpiresAt: _refreshExpiresAt, ...publicResult } = result
+    return publicResult
+  }
+
+  @Post('auth/logout')
+  logout(
+    @Body() body: { refreshToken?: string },
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const refreshToken = this.getRefreshToken(request, body)
+    const result = this.liensinaService.logout(refreshToken ?? '')
+    this.clearRefreshCookie(response)
+    return result
   }
 
   @UseGuards(AuthGuard)
   @Get('bootstrap')
   bootstrap(@Req() request: RequestWithUser) {
     return this.liensinaService.getBootstrap(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('session')
+  session(@Req() request: RequestWithUser) {
+    return this.liensinaService.getSession(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('screens/dashboard')
+  dashboardScreen(@Req() request: RequestWithUser) {
+    return this.liensinaService.getDashboardScreen(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('screens/schools')
+  schoolsScreen(@Req() request: RequestWithUser) {
+    return this.liensinaService.getSchoolsScreen(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('screens/evaluations')
+  evaluationsScreen(@Req() request: RequestWithUser) {
+    return this.liensinaService.getEvaluationsScreen(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('screens/calendar')
+  calendarScreen(@Req() request: RequestWithUser) {
+    return this.liensinaService.getCalendarScreen(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('screens/meals')
+  mealsScreen(@Req() request: RequestWithUser) {
+    return this.liensinaService.getMealsScreen(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('meal-managements')
+  listMealManagements(@Req() request: RequestWithUser) {
+    return this.liensinaService.listMealManagements(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('meal-managements/school-page')
+  listMealManagementSchoolPage(@Req() request: RequestWithUser, @Query('page') page = '1', @Query('limit') limit = '5') {
+    return this.liensinaService.listMealManagementSchoolPage(request.user!.id, page, limit)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('meal-foods')
+  searchMealFoods(@Req() request: RequestWithUser, @Query('search') search = '', @Query('limit') limit = '5') {
+    return this.liensinaService.searchMealFoods(request.user!.id, search, limit)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('meal-managements')
+  createMealManagement(@Req() request: RequestWithUser, @Body() body: CreateMealManagementPayload) {
+    return this.liensinaService.createMealManagement(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('meal-managements/:id/budget')
+  updateMealBudget(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: UpdateMealBudgetPayload) {
+    return this.liensinaService.updateMealBudget(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('meal-managements/:id/foods')
+  createMealFood(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: CreateMealFoodPayload) {
+    return this.liensinaService.createMealFood(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('meal-managements/:id/menus')
+  createMealMenu(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: UpsertMealMenuPayload) {
+    return this.liensinaService.createMealMenu(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('meal-managements/:id/menus/:menuId')
+  updateMealMenu(@Req() request: RequestWithUser, @Param('id') id: string, @Param('menuId') menuId: string, @Body() body: Partial<UpsertMealMenuPayload>) {
+    return this.liensinaService.updateMealMenu(request.user!.id, id, menuId, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Delete('meal-managements/:id/menus/:menuId')
+  deleteMealMenu(@Req() request: RequestWithUser, @Param('id') id: string, @Param('menuId') menuId: string) {
+    return this.liensinaService.deleteMealMenu(request.user!.id, id, menuId)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('screens/access')
+  accessScreen(@Req() request: RequestWithUser) {
+    return this.liensinaService.getAccessScreen(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('screens/settings')
+  settingsScreen(@Req() request: RequestWithUser) {
+    return this.liensinaService.getSettingsScreen(request.user!.id)
   }
 
   @UseGuards(AuthGuard)
@@ -49,9 +196,63 @@ export class AppController {
   }
 
   @UseGuards(AuthGuard)
+  @Post('teachers')
+  createTeacher(@Req() request: RequestWithUser, @Body() body: Partial<Teacher> & { classId?: string; password?: string; phone?: string }) {
+    return this.liensinaService.createTeacher(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('teachers/:id')
+  updateTeacher(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: Partial<Teacher> & { classId?: string }) {
+    return this.liensinaService.updateTeacher(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('students')
+  createStudent(@Req() request: RequestWithUser, @Body() body: Partial<Student> & { password?: string }) {
+    return this.liensinaService.createStudent(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('students/:id')
+  updateStudent(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: Partial<Student>) {
+    return this.liensinaService.updateStudent(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('guardians')
+  createGuardian(@Req() request: RequestWithUser, @Body() body: Partial<Guardian> & { password?: string }) {
+    return this.liensinaService.createGuardian(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('guardians/:id')
+  updateGuardian(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: Partial<Guardian>) {
+    return this.liensinaService.updateGuardian(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
   @Post('evaluations')
   createEvaluation(@Req() request: RequestWithUser, @Body() body: Partial<Evaluation>) {
     return this.liensinaService.createEvaluation(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Delete('evaluations/:id')
+  deleteEvaluation(@Req() request: RequestWithUser, @Param('id') id: string) {
+    return this.liensinaService.deleteEvaluation(request.user!.id, id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('questions')
+  createQuestion(@Req() request: RequestWithUser, @Body() body: CreateQuestionRequest) {
+    return this.liensinaService.createQuestion(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('meal-managements/:id/items')
+  createMealItem(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: CreateMealItemPayload) {
+    return this.liensinaService.createMealItem(request.user!.id, id, body)
   }
 
   @UseGuards(AuthGuard)
@@ -94,6 +295,97 @@ export class AppController {
   @Patch('profile')
   updateProfile(@Req() request: RequestWithUser, @Body() body: Partial<UserAccount>) {
     return this.liensinaService.updateProfile(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('profile/avatar')
+  @UseInterceptors(FileInterceptor('avatar', {
+    limits: { fileSize: 2 * 1024 * 1024 },
+    fileFilter: (_request: unknown, file: { mimetype: string }, callback: (error: Error | null, acceptFile: boolean) => void) => {
+      if (!file.mimetype.startsWith('image/')) {
+        callback(new BadRequestException('Envie uma imagem valida para o avatar.'), false)
+        return
+      }
+      callback(null, true)
+    },
+  }))
+  updateProfileAvatar(@Req() request: RequestWithUser, @UploadedFile() file?: UploadedProfileImageFile) {
+    if (!file) throw new BadRequestException('Envie uma imagem para atualizar o avatar.')
+    return this.liensinaService.updateProfileAvatar(request.user!.id, file)
+  }
+
+  @UseGuards(AuthGuard)
+  @Delete('profile/avatar')
+  deleteProfileAvatar(@Req() request: RequestWithUser) {
+    return this.liensinaService.deleteProfileAvatar(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('profile/banner')
+  @UseInterceptors(FileInterceptor('banner', {
+    limits: { fileSize: 4 * 1024 * 1024 },
+    fileFilter: (_request: unknown, file: { mimetype: string }, callback: (error: Error | null, acceptFile: boolean) => void) => {
+      if (!file.mimetype.startsWith('image/')) {
+        callback(new BadRequestException('Envie uma imagem valida para o banner.'), false)
+        return
+      }
+      callback(null, true)
+    },
+  }))
+  updateProfileBanner(@Req() request: RequestWithUser, @UploadedFile() file?: UploadedProfileImageFile) {
+    if (!file) throw new BadRequestException('Envie uma imagem para atualizar o banner.')
+    return this.liensinaService.updateProfileBanner(request.user!.id, file)
+  }
+
+  @UseGuards(AuthGuard)
+  @Delete('profile/banner')
+  deleteProfileBanner(@Req() request: RequestWithUser) {
+    return this.liensinaService.deleteProfileBanner(request.user!.id)
+  }
+
+  private getAuthContext(request: Request) {
+    return {
+      userAgent: request.headers['user-agent'],
+      ip: request.ip,
+    }
+  }
+
+  private getRefreshToken(request: Request, body?: { refreshToken?: string }) {
+    return body?.refreshToken || this.readCookie(request, refreshCookieName)
+  }
+
+  private readCookie(request: Request, name: string) {
+    const cookieHeader = request.headers.cookie ?? ''
+    const cookies = cookieHeader.split(';').map((value) => value.trim()).filter(Boolean)
+    const prefix = `${name}=`
+    const cookie = cookies.find((value) => value.startsWith(prefix))
+    if (!cookie) return undefined
+    return decodeURIComponent(cookie.slice(prefix.length))
+  }
+
+  private setRefreshCookie(response: Response, token: string, expiresAt: string) {
+    response.cookie(refreshCookieName, token, {
+      httpOnly: true,
+      secure: this.shouldUseSecureRefreshCookie(),
+      sameSite: 'lax',
+      path: '/api/auth',
+      expires: new Date(expiresAt),
+    })
+  }
+
+  private clearRefreshCookie(response: Response) {
+    response.clearCookie(refreshCookieName, {
+      httpOnly: true,
+      secure: this.shouldUseSecureRefreshCookie(),
+      sameSite: 'lax',
+      path: '/api/auth',
+    })
+  }
+
+  private shouldUseSecureRefreshCookie() {
+    if (process.env.AUTH_COOKIE_SECURE === 'true') return true
+    if (process.env.AUTH_COOKIE_SECURE === 'false') return false
+    return process.env.NODE_ENV === 'production'
   }
 }
 

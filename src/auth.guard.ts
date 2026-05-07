@@ -23,6 +23,7 @@ export class AuthGuard implements CanActivate {
 
     try {
       const payload = await this.jwtService.verifyAsync<JwtPayload>(token)
+      if (payload.typ !== 'access') throw new UnauthorizedException('Token invalido.')
       request.user = this.liensinaService.getUserById(payload.sub)
       return true
     } catch {
