@@ -63,6 +63,7 @@ async function bootstrap() {
       callback(new Error(`Origem CORS nao permitida: ${origin}`))
     },
     credentials: true,
+    exposedHeaders: ['Content-Disposition'],
   })
   app.setGlobalPrefix('api')
 

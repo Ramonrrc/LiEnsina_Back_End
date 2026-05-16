@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common'
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -6,31 +6,86 @@ import { dirname, resolve } from 'node:path'
 import * as bcrypt from 'bcryptjs'
 import initSqlJs = require('sql.js')
 import type { Database as SqlDatabase } from 'sql.js'
+import { Pool } from 'pg'
 
+import { getDatabaseConfig, type DatabaseConfig } from './database.config'
 import { databaseCollections } from './database.schema'
 import { buildQuestionBankSeed } from './question-bank.seed'
-import type { AssessmentDescriptor, AssessmentMatrix, AssessmentProgram, ClassRoom, CurriculumBase, CurriculumSkill, DatabaseShape, Guardian, MealBudgetStatus, MealFood, MealManagement, MealMenuStatus, MealStockStatus, Question, QuestionImportPlan, RefreshSession, Role, RoleCode, School, Student, Teacher, UserAccount } from './liensina.types'
+import type { AppNotification, AssessmentDescriptor, AssessmentMatrix, AssessmentProgram, ClassRoom, CurriculumBase, CurriculumSkill, DatabaseShape, FoodRequestStatus, Guardian, LessonRecord, MealBudgetStatus, MealFood, MealFoodRequest, MealManagement, MealMenuStatus, MealRequestHistory, MealStockStatus, MealUnit, Question, QuestionImportPlan, RefreshSession, Role, RoleCode, RoomReservation, School, StoredImageObject, Student, Teacher, UserAccount } from './liensina.types'
 
 const passwordHashPattern = /^\$2[aby]\$\d{2}\$/
 const passwordSaltRounds = 12
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
+const defaultRolePermissions: Record<RoleCode, string[]> = {
+  ADMIN: [
+    'food.view.all',
+    'food.request.manage.all',
+    'food.stock.manage',
+    'food.purchase.manage',
+    'food.supplier.manage',
+    'food.audit.view',
+    'user.manage',
+  ],
+  DIRETOR: [
+    'food.view.own_school',
+    'food.request.create',
+    'food.request.view.own_school',
+    'food.request.edit_when_adjustment',
+  ],
+  NUTRITIONIST: [
+    'food.request.view.all',
+    'food.request.approve',
+    'food.request.reject',
+    'food.request.request_adjustment',
+    'food.stock.view.all',
+    'food.expiration_alerts.view',
+  ],
+  COORDENADOR: [],
+  PROFESSOR: [],
+  ALUNO: [],
+  RESPONSAVEL: [],
+}
+
+const forbiddenRolePermissions: Partial<Record<RoleCode, string[]>> = {
+  DIRETOR: ['auditoria:ler', 'food.audit.view'],
+}
+
 @Injectable()
-export class DatabaseService implements OnModuleInit {
+export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DatabaseService.name)
+  private readonly databaseConfig: DatabaseConfig
   private readonly databasePath: string
   private data!: DatabaseShape
-  private db!: SqlDatabase
+  private db?: SqlDatabase
+  private pool?: Pool
+  private pendingPersist: Promise<void> = Promise.resolve()
 
   constructor(private readonly configService: ConfigService) {
-    const configuredPath = this.configService.get<string>('DATABASE_PATH') ?? 'data/liensina.sqlite'
-    const sqlitePath = configuredPath.endsWith('.json') ? configuredPath.replace(/\.json$/i, '.sqlite') : configuredPath
-
-    this.databasePath = resolve(process.cwd(), sqlitePath)
+    this.databaseConfig = getDatabaseConfig(this.configService)
+    this.databasePath = this.databaseConfig.sqlitePath
   }
 
   async onModuleInit() {
+    if (this.databaseConfig.driver === 'postgres') {
+      await this.initializePostgres()
+      return
+    }
+
+    await this.initializeSqlite()
+  }
+
+  async onModuleDestroy() {
+    await this.pendingPersist
+    await this.pool?.end()
+  }
+
+  getDriver() {
+    return this.databaseConfig.driver
+  }
+
+  private async initializeSqlite() {
     mkdirSync(dirname(this.databasePath), { recursive: true })
 
     const SQL = await initSqlJs({
@@ -53,6 +108,28 @@ export class DatabaseService implements OnModuleInit {
     this.logger.log(`Banco LiEnsina SQLite inicializado em ${this.databasePath}`)
   }
 
+  private async initializePostgres() {
+    if (!this.databaseConfig.postgresUrl) {
+      throw new Error('DATABASE_URL e obrigatoria quando DATABASE_DRIVER=postgres.')
+    }
+
+    this.pool = new Pool({
+      connectionString: this.databaseConfig.postgresUrl,
+      ssl: this.databaseConfig.postgresSsl ? { rejectUnauthorized: false } : undefined,
+    })
+
+    await this.ensurePostgresSchema()
+
+    const storedData = await this.readPostgresCollections()
+    if (Object.keys(storedData).length === 0) {
+      this.logger.warn('Banco LiEnsina PostgreSQL inicializado vazio. Colecoes iniciais serao criadas com o banco autoral de questoes.')
+    }
+
+    this.data = this.normalizeDatabase(storedData)
+    await this.persistPostgresNow()
+    this.logger.log('Banco LiEnsina PostgreSQL inicializado.')
+  }
+
   read(): DatabaseShape {
     return structuredClone(this.data)
   }
@@ -64,7 +141,7 @@ export class DatabaseService implements OnModuleInit {
   }
 
   private ensureSchema() {
-    this.db.run(`
+    this.db?.run(`
       CREATE TABLE IF NOT EXISTS collections (
         name TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
@@ -75,13 +152,38 @@ export class DatabaseService implements OnModuleInit {
 
   private readCollections(): Partial<DatabaseShape> {
     const output: Partial<DatabaseShape> = {}
-    const result = this.db.exec('SELECT name, payload FROM collections')
+    const result = this.db?.exec('SELECT name, payload FROM collections') ?? []
     const rows = result[0]?.values ?? []
 
     for (const row of rows) {
       const name = String(row[0]) as keyof DatabaseShape
       if (!databaseCollections.includes(name)) continue
       output[name] = JSON.parse(String(row[1])) as never
+    }
+
+    return output
+  }
+
+  private async ensurePostgresSchema() {
+    await this.pool?.query(`
+      CREATE TABLE IF NOT EXISTS collections (
+        name text PRIMARY KEY,
+        payload jsonb NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT collections_payload_is_array CHECK (jsonb_typeof(payload) = 'array')
+      )
+    `)
+    await this.pool?.query('CREATE INDEX IF NOT EXISTS collections_updated_at_idx ON collections (updated_at)')
+    await this.pool?.query('CREATE INDEX IF NOT EXISTS collections_payload_gin_idx ON collections USING gin (payload jsonb_path_ops)')
+  }
+
+  private async readPostgresCollections(): Promise<Partial<DatabaseShape>> {
+    const output: Partial<DatabaseShape> = {}
+    const result = await this.pool?.query<{ name: keyof DatabaseShape; payload: unknown }>('SELECT name, payload FROM collections')
+
+    for (const row of result?.rows ?? []) {
+      if (!databaseCollections.includes(row.name)) continue
+      output[row.name] = row.payload as never
     }
 
     return output
@@ -95,6 +197,7 @@ export class DatabaseService implements OnModuleInit {
     const rawStudents = data.students ?? []
     const rawClasses = data.classes ?? []
     const rawEvaluations = data.evaluations ?? []
+    const rawEvaluationCorrections = data.evaluationCorrections ?? []
     const rawCalendarEvents = data.calendarEvents ?? []
     const rawCurriculumBases = data.curriculumBases ?? []
     const rawCurriculumSkills = data.curriculumSkills ?? []
@@ -103,30 +206,40 @@ export class DatabaseService implements OnModuleInit {
     const rawAssessmentDescriptors = data.assessmentDescriptors ?? []
     const rawQuestions = data.questions ?? []
     const rawQuestionImportPlans = data.questionImportPlans ?? []
+    const rawLessonRecords = data.lessonRecords ?? []
+    const rawRoomReservations = data.roomReservations ?? []
     const rawMealManagements = data.mealManagements ?? []
     const rawMealFoods = this.mergeMealFoodCatalog(data.mealFoods ?? [], rawMealManagements)
+    const rawMealFoodRequests = data.mealFoodRequests ?? []
+    const rawMealRequestHistory = data.mealRequestHistory ?? []
     const rawAuditEvents = data.auditEvents ?? []
     const rawUsers = data.users ?? []
     const rawRefreshSessions = data.refreshSessions ?? []
+    const rawNotifications = data.notifications ?? []
 
     const idMaps = {
       roles: this.createUuidMap(rawRoles),
       users: this.createUuidMap(rawUsers),
+      notifications: this.createUuidMap(rawNotifications),
       schools: this.createUuidMap(rawSchools),
       teachers: this.createUuidMap(rawTeachers),
       guardians: this.createUuidMap(rawGuardians),
       students: this.createUuidMap(rawStudents),
       classes: this.createUuidMap(rawClasses),
       evaluations: this.createUuidMap(rawEvaluations),
+      evaluationCorrections: this.createUuidMap(rawEvaluationCorrections),
       calendarEvents: this.createUuidMap(rawCalendarEvents),
+      roomReservations: this.createUuidMap(rawRoomReservations),
       mealManagements: this.createUuidMap(rawMealManagements),
+      mealFoodRequests: this.createUuidMap(rawMealFoodRequests),
+      mealRequestHistory: this.createUuidMap(rawMealRequestHistory),
       auditEvents: this.createUuidMap(rawAuditEvents),
     }
 
-    const roles = rawRoles.map((role) => this.normalizeRole({
+    const roles = this.ensureBaseRoles(rawRoles.map((role) => this.normalizeRole({
       ...role,
       id: this.remapId(role.id, idMaps.roles),
-    }))
+    })))
     const schools = rawSchools.map((school) => ({ ...school, id: this.remapId(school.id, idMaps.schools), active: school.active ?? true }))
     const schoolMap = new Map(schools.map((school) => [school.id, school]))
     const defaultSchoolId = schools[0]?.id ?? ''
@@ -240,9 +353,49 @@ export class DatabaseService implements OnModuleInit {
       }
     }
 
+    const nutritionistRoleId = this.getRoleIdFromCode(roles, 'NUTRITIONIST')
+    if (nutritionistRoleId && !Array.from(usersById.values()).some((user) => user.roleId === nutritionistRoleId)) {
+      const nutritionistUserId = randomUUID()
+      usersById.set(nutritionistUserId, this.normalizeUser({
+        id: nutritionistUserId,
+        name: 'Nutricionista da Secretaria',
+        email: 'nutricionista@liensina.local',
+        login: 'nutricionista@liensina.local',
+        password: 'Nutri@2026!',
+        roleId: nutritionistRoleId,
+        schoolId: null,
+        status: 'ativo',
+        phone: '',
+      }, roles))
+    }
+
     const normalizedUsers = Array.from(usersById.values())
+    for (const user of normalizedUsers) {
+      if (user.linkedTeacherId) {
+        const teacher = teachers.find((item) => item.id === user.linkedTeacherId)
+        if (teacher) {
+          this.applyProfileVisuals(teacher, user)
+        }
+      }
+
+      if (user.linkedStudentId) {
+        const student = students.find((item) => item.id === user.linkedStudentId)
+        if (student) {
+          this.applyProfileVisuals(student, user)
+        }
+      }
+
+      if (user.linkedGuardianId) {
+        const guardian = guardians.find((item) => item.id === user.linkedGuardianId)
+        if (guardian) {
+          this.applyProfileVisuals(guardian, user)
+        }
+      }
+    }
     const mealFoods = this.normalizeMealFoods(rawMealFoods)
     const mealManagements = this.normalizeMealManagements(rawMealManagements, idMaps.mealManagements, idMaps.schools, idMaps.users, mealFoods)
+    const mealFoodRequests = this.normalizeMealFoodRequests(rawMealFoodRequests, idMaps.mealFoodRequests, idMaps.schools, idMaps.users)
+    const mealRequestHistory = this.normalizeMealRequestHistory(rawMealRequestHistory, idMaps.mealRequestHistory, idMaps.mealFoodRequests, idMaps.schools, idMaps.users, roles)
     const questionSeed = buildQuestionBankSeed()
     const curriculumBases = this.mergeSeedById(rawCurriculumBases, questionSeed.curriculumBases)
     const curriculumSkills = this.mergeSeedById(rawCurriculumSkills, questionSeed.curriculumSkills)
@@ -265,6 +418,15 @@ export class DatabaseService implements OnModuleInit {
         id: this.remapId(evaluation.id, idMaps.evaluations),
         classId: this.remapId(evaluation.classId, idMaps.classes),
       })),
+      evaluationCorrections: rawEvaluationCorrections.map((correction) => ({
+        ...correction,
+        id: this.remapId(correction.id, idMaps.evaluationCorrections),
+        evaluationId: this.remapId(correction.evaluationId, idMaps.evaluations),
+        classId: this.remapId(correction.classId, idMaps.classes),
+        studentId: this.remapId(correction.studentId, idMaps.students),
+        reviewedById: this.remapNullableId(correction.reviewedById, idMaps.users),
+        createdById: this.remapOptionalId(correction.createdById, idMaps.users) ?? '',
+      })),
       curriculumBases,
       curriculumSkills,
       assessmentPrograms,
@@ -272,15 +434,25 @@ export class DatabaseService implements OnModuleInit {
       assessmentDescriptors,
       questions,
       questionImportPlans,
+      lessonRecords: this.normalizeLessonRecords(rawLessonRecords, new Set(classes.map((classRoom) => classRoom.id))),
+      roomReservations: this.normalizeRoomReservations(rawRoomReservations.map((reservation) => ({
+        ...reservation,
+        id: this.remapId(reservation.id, idMaps.roomReservations),
+        classId: this.remapId(reservation.classId, idMaps.classes),
+      })), new Set(classes.map((classRoom) => classRoom.id))),
       calendarEvents: rawCalendarEvents.map((calendarEvent) => ({
         ...calendarEvent,
         id: this.remapId(calendarEvent.id, idMaps.calendarEvents),
         schoolId: this.remapId(calendarEvent.schoolId, idMaps.schools),
         classId: this.remapNullableId(calendarEvent.classId, idMaps.classes),
+        createdById: this.remapOptionalId(calendarEvent.createdById, idMaps.users) ?? '',
       })),
       mealFoods,
       mealManagements,
+      mealFoodRequests,
+      mealRequestHistory,
       refreshSessions: this.normalizeRefreshSessions(rawRefreshSessions, normalizedUsers),
+      notifications: this.normalizeNotifications(rawNotifications, idMaps.notifications, idMaps.users, normalizedUsers),
       auditEvents: rawAuditEvents.map((auditEvent) => ({
         ...auditEvent,
         id: this.remapId(auditEvent.id, idMaps.auditEvents),
@@ -384,19 +556,39 @@ export class DatabaseService implements OnModuleInit {
 
   private normalizeRole(role: Partial<Role>): Role {
     const code = this.normalizeRoleCode(role.code ?? role.name ?? this.roleCodeFromLegacyId(String(role.id ?? '')) ?? 'ADMIN')
+    const deniedPermissions = forbiddenRolePermissions[code] ?? []
 
     return {
       id: this.ensureUuid(role.id),
       code,
       name: code,
       description: String(role.description ?? '').trim(),
-      permissions: Array.isArray(role.permissions) ? role.permissions : [],
+      permissions: Array.from(new Set([
+        ...(Array.isArray(role.permissions) ? role.permissions : []),
+        ...(defaultRolePermissions[code] ?? []),
+      ])).filter((permission) => !deniedPermissions.includes(permission)),
     }
+  }
+
+  private ensureBaseRoles(roles: Role[]) {
+    const output = [...roles]
+    for (const code of ['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR', 'ALUNO', 'RESPONSAVEL', 'NUTRITIONIST'] as RoleCode[]) {
+      if (output.some((role) => role.code === code)) continue
+      output.push({
+        id: randomUUID(),
+        code,
+        name: code,
+        description: code === 'NUTRITIONIST' ? 'Avalia solicitacoes de merenda escolar.' : '',
+        permissions: defaultRolePermissions[code] ?? [],
+      })
+    }
+    return output
   }
 
   private normalizeRoleCode(value: unknown): RoleCode {
     const code = String(value ?? '').trim().toUpperCase()
-    if (code === 'ADMIN' || code === 'DIRETOR' || code === 'COORDENADOR' || code === 'PROFESSOR' || code === 'ALUNO' || code === 'RESPONSAVEL') {
+    if (code === 'NUTRICIONISTA') return 'NUTRITIONIST'
+    if (code === 'ADMIN' || code === 'DIRETOR' || code === 'COORDENADOR' || code === 'PROFESSOR' || code === 'ALUNO' || code === 'RESPONSAVEL' || code === 'NUTRITIONIST') {
       return code
     }
     return 'ADMIN'
@@ -417,7 +609,61 @@ export class DatabaseService implements OnModuleInit {
       phone: user.phone ?? '',
       cpf: user.cpf ?? '',
       birthDate: user.birthDate ?? '',
-      bannerUrl: user.bannerUrl ?? '',
+      avatarUrl: user.avatarUrl ?? user.avatarObject?.publicUrl ?? '',
+      bannerUrl: user.bannerUrl ?? user.bannerObject?.publicUrl ?? '',
+      avatarObject: this.normalizeStoredImageObject(user.avatarObject, user.avatarUrl),
+      bannerObject: this.normalizeStoredImageObject(user.bannerObject, user.bannerUrl),
+    }
+  }
+
+  private normalizeStoredImageObject(value: unknown, fallbackUrl?: string): StoredImageObject | null {
+    if (value && typeof value === 'object') {
+      const object = value as Partial<StoredImageObject>
+      const bucket = String(object.bucket ?? '').trim()
+      const key = String(object.key ?? '').trim()
+      const publicUrl = String(object.publicUrl ?? '').trim()
+      if (bucket && key && publicUrl) {
+        return {
+          storageProvider: object.storageProvider === 'bucket' ? 'bucket' : 'local',
+          bucket,
+          key,
+          publicUrl,
+          contentType: String(object.contentType ?? 'image/*'),
+          sizeBytes: Number(object.sizeBytes ?? 0),
+          originalName: String(object.originalName ?? ''),
+          uploadedAt: this.normalizeIsoDate(object.uploadedAt),
+        }
+      }
+    }
+
+    const cleanUrl = String(fallbackUrl ?? '').split(/[?#]/)[0]
+    const match = cleanUrl.match(/^\/uploads\/([^/]+)\/(.+)$/)
+    if (!match) return null
+
+    return {
+      storageProvider: 'local',
+      bucket: match[1],
+      key: match[2],
+      publicUrl: cleanUrl,
+      contentType: 'image/*',
+      sizeBytes: 0,
+      originalName: '',
+      uploadedAt: new Date().toISOString(),
+    }
+  }
+
+  private applyProfileVisuals<T extends { avatarUrl?: string; bannerUrl?: string; avatarObject?: StoredImageObject | null; bannerObject?: StoredImageObject | null }>(
+    entity: T,
+    user: UserAccount,
+  ) {
+    if (user.avatarUrl || user.avatarObject) {
+      entity.avatarUrl = user.avatarUrl ?? user.avatarObject?.publicUrl ?? entity.avatarUrl
+      entity.avatarObject = user.avatarObject ?? entity.avatarObject
+    }
+
+    if (user.bannerUrl || user.bannerObject) {
+      entity.bannerUrl = user.bannerUrl ?? user.bannerObject?.publicUrl ?? entity.bannerUrl
+      entity.bannerObject = user.bannerObject ?? entity.bannerObject
     }
   }
 
@@ -449,6 +695,36 @@ export class DatabaseService implements OnModuleInit {
         userAgent: session.userAgent,
         ip: session.ip,
       }))
+  }
+
+  private normalizeNotifications(notifications: AppNotification[], notificationMap: Map<string, string>, userMap: Map<string, string>, users: UserAccount[]): AppNotification[] {
+    const userIds = new Set(users.map((user) => user.id))
+
+    return notifications
+      .map((notification) => {
+        const userId = this.remapOptionalId(notification.userId, userMap) ?? ''
+        const tone = notification.tone === 'danger' || notification.tone === 'warning' || notification.tone === 'info'
+          ? notification.tone
+          : 'info'
+        const sourceType = notification.sourceType === 'student-risk' || notification.sourceType === 'system'
+          ? notification.sourceType
+          : 'system'
+        const readAt = String(notification.readAt ?? '').trim()
+
+        return {
+          id: this.remapId(notification.id, notificationMap),
+          userId,
+          title: String(notification.title ?? '').trim(),
+          description: String(notification.description ?? '').trim(),
+          tone,
+          sourceType,
+          sourceId: String(notification.sourceId ?? '').trim(),
+          readAt: readAt ? this.normalizeIsoDate(readAt) : null,
+          createdAt: this.normalizeIsoDate(notification.createdAt),
+          updatedAt: this.normalizeIsoDate(notification.updatedAt),
+        }
+      })
+      .filter((notification) => userIds.has(notification.userId) && Boolean(notification.title))
   }
 
   private normalizeTeacher(teacher: Partial<Teacher>): Teacher {
@@ -512,7 +788,7 @@ export class DatabaseService implements OnModuleInit {
     return {
       id: this.ensureUuid(classRoom.id),
       name: String(classRoom.name ?? 'Turma sem nome').trim(),
-      grade: String(classRoom.grade ?? '').trim(),
+      grade: this.normalizeClassGrade(classRoom.grade),
       shift: classRoom.shift ?? 'Manha',
       schoolId: String(classRoom.schoolId ?? '').trim(),
       teacherId,
@@ -521,6 +797,72 @@ export class DatabaseService implements OnModuleInit {
       schedule: String(classRoom.schedule ?? '').trim(),
       bnccFocus: Array.isArray(classRoom.bnccFocus) ? classRoom.bnccFocus : [],
     }
+  }
+
+  private normalizeLessonRecords(records: Partial<LessonRecord>[], classIds: Set<string>): LessonRecord[] {
+    return records
+      .map((record) => ({
+        id: this.ensureUuid(record.id),
+        classId: String(record.classId ?? '').trim(),
+        subject: String(record.subject ?? '').trim(),
+        date: this.normalizeNullableDate(record.date) ?? new Date().toISOString().slice(0, 10),
+        time: String(record.time ?? '').trim(),
+        content: String(record.content ?? '').trim(),
+        plan: String(record.plan ?? '').trim(),
+        resources: String(record.resources ?? '').trim(),
+        activity: String(record.activity ?? '').trim(),
+        notes: String(record.notes ?? '').trim(),
+      }))
+      .filter((record) => classIds.has(record.classId) && Boolean(record.subject || record.content))
+  }
+
+  private normalizeRoomReservations(records: Partial<RoomReservation>[], classIds: Set<string>): RoomReservation[] {
+    return records
+      .map((record) => ({
+        id: this.ensureUuid(record.id),
+        room: String(record.room ?? '').trim(),
+        date: this.normalizeNullableDate(record.date) ?? new Date().toISOString().slice(0, 10),
+        startTime: this.normalizeReservationTime(record.startTime, '07:00'),
+        endTime: this.normalizeReservationTime(record.endTime, '07:30'),
+        classId: String(record.classId ?? '').trim(),
+        purpose: String(record.purpose ?? '').trim(),
+      }))
+      .filter((record) => (
+        classIds.has(record.classId) &&
+        Boolean(record.room) &&
+        record.endTime > record.startTime
+      ))
+  }
+
+  private normalizeReservationTime(value: unknown, fallback: string) {
+    const time = String(value ?? '').trim()
+    if (!/^\d{2}:\d{2}$/.test(time)) return fallback
+
+    const [hour, minute] = time.split(':').map(Number)
+    if (!Number.isInteger(hour) || !Number.isInteger(minute)) return fallback
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return fallback
+
+    return time
+  }
+
+  private normalizeClassGrade(value?: string | null) {
+    const current = String(value ?? '').trim()
+    const direct = current.toUpperCase()
+    if (/^EF[1-9]$/.test(direct) || /^EM[1-3]$/.test(direct)) return direct
+
+    const normalized = current
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[º°]/g, '')
+      .replace(/[^a-zA-Z0-9]+/g, ' ')
+      .trim()
+      .toUpperCase()
+    const year = Number(normalized.match(/\b([1-9])\b/)?.[1] ?? 0)
+
+    if (year >= 1 && year <= 3 && normalized.includes('MEDIO')) return `EM${year}`
+    if (year >= 1 && year <= 9 && (normalized.includes('FUNDAMENTAL') || normalized.includes('ANO'))) return `EF${year}`
+
+    return current
   }
 
   private mergeMealFoodCatalog(catalog: MealFood[], managements: MealManagement[]) {
@@ -702,6 +1044,69 @@ export class DatabaseService implements OnModuleInit {
     })
   }
 
+  private normalizeMealFoodRequests(
+    requests: MealFoodRequest[],
+    requestMap: Map<string, string>,
+    schoolMap: Map<string, string>,
+    userMap: Map<string, string>,
+  ): MealFoodRequest[] {
+    return requests.map((request) => {
+      const createdAt = this.normalizeIsoDate(request.createdAt)
+      return {
+        ...request,
+        id: this.remapId(request.id, requestMap),
+        schoolId: this.remapId(request.schoolId, schoolMap),
+        requestedBy: this.remapId(request.requestedBy, userMap),
+        itemName: String(request.itemName ?? 'Alimento').trim(),
+        quantity: Math.max(0, Number(request.quantity ?? 0)),
+        unit: this.normalizeMealUnit(request.unit),
+        unitPrice: request.unitPrice === undefined || request.unitPrice === null ? null : Math.max(0, Number(request.unitPrice)),
+        reason: String(request.reason ?? '').trim(),
+        urgencyLevel: this.normalizeFoodRequestUrgency(request.urgencyLevel),
+        expirationDate: this.normalizeNullableDate(request.expirationDate),
+        observation: request.observation ? String(request.observation).trim() : null,
+        status: this.normalizeFoodRequestStatus(request.status),
+        reviewedBy: this.remapNullableId(request.reviewedBy, userMap),
+        reviewedAt: request.reviewedAt ? this.normalizeIsoDate(request.reviewedAt) : null,
+        nutritionistObservation: request.nutritionistObservation ? String(request.nutritionistObservation).trim() : null,
+        rejectionReason: request.rejectionReason ? String(request.rejectionReason).trim() : null,
+        suggestedQuantity: request.suggestedQuantity === undefined || request.suggestedQuantity === null ? null : Math.max(0, Number(request.suggestedQuantity)),
+        suggestedUnit: request.suggestedUnit ? this.normalizeMealUnit(request.suggestedUnit) : null,
+        suggestedUnitPrice: request.suggestedUnitPrice === undefined || request.suggestedUnitPrice === null ? null : Math.max(0, Number(request.suggestedUnitPrice)),
+        confirmedBy: this.remapNullableId(request.confirmedBy, userMap),
+        confirmedAt: request.confirmedAt ? this.normalizeIsoDate(request.confirmedAt) : null,
+        supplierName: request.supplierName ? String(request.supplierName).trim() : null,
+        purchaseValue: request.purchaseValue === undefined || request.purchaseValue === null ? null : Number(request.purchaseValue),
+        purchaseDate: this.normalizeNullableDate(request.purchaseDate),
+        stockItemId: request.stockItemId ? this.ensureUuid(request.stockItemId) : null,
+        createdAt,
+        updatedAt: request.updatedAt ? this.normalizeIsoDate(request.updatedAt) : createdAt,
+      }
+    })
+  }
+
+  private normalizeMealRequestHistory(
+    history: MealRequestHistory[],
+    historyMap: Map<string, string>,
+    requestMap: Map<string, string>,
+    schoolMap: Map<string, string>,
+    userMap: Map<string, string>,
+    roles: Role[],
+  ): MealRequestHistory[] {
+    return history.map((entry) => ({
+      ...entry,
+      id: this.remapId(entry.id, historyMap),
+      action: entry.action,
+      entityType: entry.entityType === 'MEAL_STOCK' ? 'MEAL_STOCK' : 'FOOD_REQUEST',
+      entityId: entry.entityType === 'MEAL_STOCK' ? this.ensureUuid(entry.entityId) : this.remapId(entry.entityId, requestMap),
+      userId: this.remapId(entry.userId, userMap),
+      userRole: roles.some((role) => role.code === entry.userRole) ? entry.userRole : 'ADMIN',
+      schoolId: this.remapId(entry.schoolId, schoolMap),
+      description: String(entry.description ?? 'Movimentacao de merenda').trim(),
+      createdAt: this.normalizeIsoDate(entry.createdAt),
+    }))
+  }
+
   private normalizeMealFoods(foods: MealFood[]) {
     const seen = new Set<number>()
 
@@ -761,9 +1166,32 @@ export class DatabaseService implements OnModuleInit {
     return Number.isInteger(id) && id > 0 ? id : fallback
   }
 
-  private normalizeMealUnit(value: unknown): 'KG' | 'UN' | 'L' {
+  private normalizeMealUnit(value: unknown): MealUnit {
     const unit = String(value ?? '').trim().toUpperCase()
-    return unit === 'UN' || unit === 'L' ? unit : 'KG'
+    if (unit === 'UN') return 'UNIT'
+    if (unit === 'KG' || unit === 'G' || unit === 'L' || unit === 'ML' || unit === 'UNIT' || unit === 'BOX' || unit === 'PACKAGE' || unit === 'DOZEN') return unit
+    return 'KG'
+  }
+
+  private normalizeFoodRequestStatus(value: unknown): FoodRequestStatus {
+    const status = String(value ?? '').trim().toUpperCase()
+    if (
+      status === 'PENDING_NUTRITIONIST_APPROVAL'
+      || status === 'APPROVED_BY_NUTRITIONIST'
+      || status === 'REJECTED_BY_NUTRITIONIST'
+      || status === 'NEEDS_ADJUSTMENT'
+      || status === 'PENDING_PURCHASE'
+      || status === 'PURCHASED'
+      || status === 'ADDED_TO_STOCK'
+      || status === 'CANCELLED'
+    ) return status
+    return 'PENDING_NUTRITIONIST_APPROVAL'
+  }
+
+  private normalizeFoodRequestUrgency(value: unknown) {
+    const urgency = String(value ?? '').trim().toUpperCase()
+    if (urgency === 'LOW' || urgency === 'MEDIUM' || urgency === 'HIGH' || urgency === 'URGENT') return urgency
+    return 'MEDIUM'
   }
 
   private normalizeMealType(value: unknown): 'CAFE_DA_MANHA' | 'LANCHE' | 'ALMOCO' | 'JANTAR' {
@@ -858,6 +1286,8 @@ export class DatabaseService implements OnModuleInit {
       'role-professor': 'PROFESSOR',
       'role-aluno': 'ALUNO',
       'role-responsavel': 'RESPONSAVEL',
+      'role-nutritionist': 'NUTRITIONIST',
+      'role-nutricionista': 'NUTRITIONIST',
       Secretaria: 'ADMIN',
       Diretor: 'DIRETOR',
       Professor: 'PROFESSOR',
@@ -867,6 +1297,8 @@ export class DatabaseService implements OnModuleInit {
       PROFESSOR: 'PROFESSOR',
       ALUNO: 'ALUNO',
       RESPONSAVEL: 'RESPONSAVEL',
+      NUTRITIONIST: 'NUTRITIONIST',
+      NUTRICIONISTA: 'NUTRITIONIST',
     }
 
     return legacy[roleId] ?? null
@@ -889,19 +1321,56 @@ export class DatabaseService implements OnModuleInit {
   }
 
   private persist() {
-    this.ensureSchema()
-    this.db.run('BEGIN TRANSACTION')
-    this.db.run('DELETE FROM collections')
+    if (this.databaseConfig.driver === 'postgres') {
+      this.pendingPersist = this.pendingPersist
+        .then(() => this.persistPostgresNow())
+        .catch((error: unknown) => {
+          this.logger.error('Falha ao persistir dados no PostgreSQL.', error instanceof Error ? error.stack : String(error))
+        })
+      return
+    }
 
-    const statement = this.db.prepare('INSERT INTO collections (name, payload, updated_at) VALUES (?, ?, ?)')
+    this.ensureSchema()
+    this.db?.run('BEGIN TRANSACTION')
+    this.db?.run('DELETE FROM collections')
+
+    const statement = this.db?.prepare('INSERT INTO collections (name, payload, updated_at) VALUES (?, ?, ?)')
     const updatedAt = new Date().toISOString()
 
     for (const collection of databaseCollections) {
-      statement.run([collection, JSON.stringify(this.data[collection] ?? []), updatedAt])
+      statement?.run([collection, JSON.stringify(this.data[collection] ?? []), updatedAt])
     }
 
-    statement.free()
-    this.db.run('COMMIT')
-    writeFileSync(this.databasePath, Buffer.from(this.db.export()))
+    statement?.free()
+    this.db?.run('COMMIT')
+    if (this.db) writeFileSync(this.databasePath, Buffer.from(this.db.export()))
+  }
+
+  private async persistPostgresNow() {
+    if (!this.pool) throw new Error('Pool PostgreSQL nao inicializado.')
+
+    const client = await this.pool.connect()
+    const updatedAt = new Date()
+
+    try {
+      await client.query('BEGIN')
+      for (const collection of databaseCollections) {
+        await client.query(
+          `
+            INSERT INTO collections (name, payload, updated_at)
+            VALUES ($1, $2::jsonb, $3)
+            ON CONFLICT (name)
+            DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at
+          `,
+          [collection, JSON.stringify(this.data[collection] ?? []), updatedAt],
+        )
+      }
+      await client.query('COMMIT')
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
   }
 }

@@ -2,18 +2,42 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException,
 import { ConfigService } from '@nestjs/config'
 import { JwtService } from '@nestjs/jwt'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs'
-import { extname, join, resolve, sep } from 'node:path'
+import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { dirname, extname, join, resolve, sep } from 'node:path'
 import * as bcrypt from 'bcryptjs'
 
 import { DatabaseService } from './database.service'
-import type { AssessmentDescriptor, AssessmentMatrix, AssessmentProgram, CalendarEventType, ClassRoom, CreateMealFoodPayload, CreateMealItemPayload, CreateMealManagementPayload, CreateQuestionRequest, DatabaseShape, Difficulty, EducationStage, Evaluation, EvaluationBuildMode, GenerateEnemQuestionsRequest, GenerateEnemQuestionsResponse, Guardian, JwtPayload, MealFood, MealManagement, MealMenu, MealMenuStatus, MealShift, MealStockStatus, MealType, PublicUserAccount, Question, QuestionDescriptorSummary, QuestionSourceType, QuestionStatus, QuestionType, QuestionVisibility, RefreshSession, Role, RoleCode, School, SchoolCalendarEvent, Student, Teacher, UpdateMealBudgetPayload, UpsertMealMenuPayload, UserAccount } from './liensina.types'
+import { writeEvaluationPdfFile } from './evaluation-pdf'
+import type { AddMealFoodRequestToStockPayload, AppNotification, AssessmentDescriptor, AssessmentMatrix, AssessmentProgram, CalendarEventType, ClassRoom, CreateMealFoodPayload, CreateMealFoodRequestPayload, CreateMealItemPayload, CreateMealManagementPayload, CreateQuestionRequest, DatabaseShape, Difficulty, EducationStage, Evaluation, EvaluationAnswerKeyItem, EvaluationBuildMode, EvaluationCorrection, EvaluationCorrectionDetectedAnswer, EvaluationCorrectionReviewPayload, FoodRequestStatus, GenerateEnemQuestionsRequest, GenerateEnemQuestionsResponse, GenerateQuestionSelectionRequest, GenerateQuestionSelectionResponse, Guardian, JwtPayload, LessonRecord, MealFood, MealFoodRequest, MealManagement, MealMenu, MealMenuStatus, MealRequestHistory, MealRequestHistoryAction, MealShift, MealStockStatus, MealType, MealUnit, NotificationsScreenPayload, PublicUserAccount, Question, QuestionDescriptorSummary, QuestionSourceType, QuestionStatus, QuestionType, QuestionVisibility, RefreshSession, ReviewMealFoodRequestPayload, Role, RoleCode, RoomReservation, School, SchoolCalendarEvent, StoredImageObject, Student, Teacher, UpdateMealBudgetPayload, UpdateMealFoodRequestPayload, UpsertMealMenuPayload, UserAccount } from './liensina.types'
 
 type ProfileImageFile = {
   buffer: Buffer
   originalname: string
   mimetype: string
   size: number
+}
+
+type OmrImageFile = ProfileImageFile
+
+type OmrServiceAnswer = EvaluationCorrectionDetectedAnswer
+type OmrServiceResponse = {
+  examId: string
+  versionId: string
+  answerCardId?: string | null
+  studentId?: string | null
+  classId?: string | null
+  suggestedScore: number
+  correctCount: number
+  wrongCount: number
+  blankCount: number
+  multipleCount: number
+  totalQuestions: number
+  confidence: number
+  requiresReview: boolean
+  shouldRetakeImage: boolean
+  failures: string[]
+  detectedAnswers: OmrServiceAnswer[]
+  [key: string]: unknown
 }
 
 export type AuthContext = {
@@ -27,7 +51,12 @@ const defaultRefreshReuseGraceSeconds = 15
 const enemApiBaseUrl = 'https://api.enem.dev/v1/exams'
 const defaultEnemYears = Array.from({ length: 2023 - 2009 + 1 }, (_, index) => 2009 + index)
 const enemQuestionPageLimit = 50
+const defaultMealBudgetLimit = 30000
+const defaultMealBudgetAlertPercent = 80
 const enemMarkdownImagePattern = /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/gi
+const forbiddenRolePermissions: Partial<Record<RoleCode, string[]>> = {
+  DIRETOR: ['auditoria:ler', 'food.audit.view'],
+}
 
 type EnemDevAlternative = {
   letter?: string
@@ -63,6 +92,12 @@ type DownloadedQuestionImage = {
   dataUrl: string
   mimeType: string
   sizeBytes: number
+}
+
+type EvaluationDownloadFile = {
+  filePath: string
+  filename: string
+  contentType: string
 }
 
 function parseDurationSeconds(value: string | undefined, fallback: number) {
@@ -103,7 +138,7 @@ export class LiensinaService {
 
     let refreshToken = ''
     let refreshExpiresAt = ''
-    let publicUser = this.toPublicUser(user)
+    let publicUser = this.toPublicUserWithResolvedSchool(data, user)
 
     this.database.update((currentData) => {
       this.removeExpiredRefreshSessions(currentData)
@@ -115,7 +150,7 @@ export class LiensinaService {
       currentData.refreshSessions.push(refreshSession.session)
       refreshToken = refreshSession.token
       refreshExpiresAt = refreshSession.session.expiresAt
-      publicUser = this.toPublicUser(storedUser)
+      publicUser = this.toPublicUserWithResolvedSchool(currentData, storedUser)
       this.pushAudit(currentData, storedUser.id, 'Login realizado', storedUser.name)
     })
 
@@ -134,6 +169,7 @@ export class LiensinaService {
   async refreshLogin(refreshToken: string, context: AuthContext = {}) {
     const tokenHash = this.hashRefreshToken(refreshToken)
     let user: UserAccount | null = null
+    let publicUser: PublicUserAccount | null = null
     let nextRefreshToken = ''
     let refreshExpiresAt = ''
 
@@ -156,6 +192,7 @@ export class LiensinaService {
       nextRefreshToken = nextSession.token
       refreshExpiresAt = nextSession.session.expiresAt
       user = storedUser
+      publicUser = this.toPublicUserWithResolvedSchool(data, storedUser)
     })
 
     if (!user) throw new UnauthorizedException('Usuario nao encontrado.')
@@ -167,7 +204,7 @@ export class LiensinaService {
       expiresAt: accessToken.expiresAt,
       refreshToken: nextRefreshToken,
       refreshExpiresAt,
-      user: this.toPublicUser(user),
+      user: publicUser ?? this.toPublicUser(user),
     }
   }
 
@@ -196,10 +233,10 @@ export class LiensinaService {
     const currentUser = this.ensureCurrentUser(data, userId)
 
     return {
-      currentUser: this.toPublicUser(currentUser),
+      currentUser: this.toPublicUserWithResolvedSchool(data, currentUser),
       dashboard: this.buildDashboard(data),
       roles: data.roles,
-      users: data.users.map((user) => this.toPublicUser(user)),
+      users: data.users.map((user) => this.toPublicUserWithResolvedSchool(data, user)),
       schools: data.schools,
       teachers: data.teachers,
       guardians: data.guardians,
@@ -207,29 +244,29 @@ export class LiensinaService {
       classes: data.classes,
       evaluations: data.evaluations,
       calendarEvents: data.calendarEvents,
+      roomReservations: data.roomReservations,
       mealManagements: data.mealManagements,
       auditEvents: data.auditEvents,
     }
   }
 
   getSession(userId: string) {
-    const data = this.database.read()
+    const data = this.syncNotificationsForUser(userId)
     const currentUser = this.ensureCurrentUser(data, userId)
-    const dashboard = this.buildDashboard(data)
 
     return {
-      currentUser: this.toPublicUser(currentUser),
+      currentUser: this.toPublicUserWithResolvedSchool(data, currentUser),
       currentRole: data.roles.find((role) => role.id === currentUser.roleId) ?? null,
-      alertCount: dashboard.alerts.length,
+      alertCount: this.getUnreadNotificationCount(data, userId),
     }
   }
 
-  getDashboardScreen(userId: string) {
+  getDashboardScreen(userId: string, alertPage: string | number = 1, alertLimit: string | number = 10) {
     const data = this.database.read()
     this.ensureCurrentUser(data, userId)
 
     return {
-      dashboard: this.buildDashboard(data),
+      dashboard: this.buildDashboard(data, alertPage, alertLimit),
       evaluations: data.evaluations,
       auditEvents: data.auditEvents,
     }
@@ -245,22 +282,177 @@ export class LiensinaService {
       guardians: data.guardians,
       students: data.students,
       classes: data.classes,
+      lessonRecords: data.lessonRecords,
+      roomReservations: data.roomReservations,
     }
+  }
+
+  listRoomReservations(userId: string) {
+    const data = this.database.read()
+    const currentUser = this.ensureCurrentUser(data, userId)
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const schoolIds = new Set(scoped.schools.map((school) => school.id))
+    const schoolByClassId = new Map(data.classes.map((classRoom) => [classRoom.id, classRoom.schoolId]))
+
+    return data.roomReservations.filter((reservation) => {
+      const reservationSchoolId = schoolByClassId.get(reservation.classId)
+      return reservationSchoolId ? schoolIds.has(reservationSchoolId) : false
+    })
+  }
+
+  listLessonRecords(userId: string) {
+    const data = this.database.read()
+    const currentUser = this.ensureCurrentUser(data, userId)
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const classIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+
+    return data.lessonRecords.filter((record) => classIds.has(record.classId))
+  }
+
+  listTeachersPage(
+    userId: string,
+    rawPage: string | number = 1,
+    rawLimit: string | number = 10,
+    search = '',
+    schoolId = 'all',
+    discipline = 'all',
+  ) {
+    const data = this.database.read()
+    const currentUser = this.ensureCurrentUser(data, userId)
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const query = this.normalizeTextKey(search)
+    const schoolFilter = String(schoolId ?? 'all').trim()
+    const disciplineFilter = this.normalizeTextKey(discipline === 'all' ? '' : discipline)
+
+    const teachers = scoped.teachers.filter((teacher) => {
+      if (schoolFilter && schoolFilter !== 'all' && teacher.schoolId !== schoolFilter) return false
+      if (disciplineFilter) {
+        const specialty = this.normalizeTextKey(teacher.specialty)
+        if (!specialty.includes(disciplineFilter) && !disciplineFilter.includes(specialty)) return false
+      }
+      if (!query) return true
+
+      return this.normalizeTextKey(`${teacher.name} ${teacher.email} ${teacher.specialty}`).includes(query)
+    })
+
+    const page = this.paginate(teachers, rawPage, rawLimit, 10)
+
+    return {
+      teachers: page.items,
+      pagination: page.pagination,
+    }
+  }
+
+  listStudentsPage(
+    userId: string,
+    rawPage: string | number = 1,
+    rawLimit: string | number = 10,
+    search = '',
+    schoolId = 'all',
+    discipline = 'all',
+  ) {
+    const data = this.database.read()
+    const currentUser = this.ensureCurrentUser(data, userId)
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const query = this.normalizeTextKey(search)
+    const schoolFilter = String(schoolId ?? 'all').trim()
+    const disciplineFilter = this.normalizeTextKey(discipline === 'all' ? '' : discipline)
+    const disciplineClassIds = new Set(scoped.classes
+      .filter((classRoom) => {
+        if (!disciplineFilter) return true
+        return (classRoom.bnccFocus ?? []).some((focus) => this.normalizeTextKey(focus).includes(disciplineFilter))
+      })
+      .map((classRoom) => classRoom.id))
+
+    const students = scoped.students.filter((student) => {
+      if (schoolFilter && schoolFilter !== 'all' && student.schoolId !== schoolFilter) return false
+      if (disciplineFilter && !disciplineClassIds.has(student.classId)) return false
+      if (!query) return true
+
+      return this.normalizeTextKey(`${student.name} ${student.login} ${student.registrationNumber} ${student.registration}`).includes(query)
+    })
+
+    const page = this.paginate(students, rawPage, rawLimit, 10)
+
+    return {
+      students: page.items,
+      pagination: page.pagination,
+    }
+  }
+
+  getNotificationsScreen(userId: string): NotificationsScreenPayload {
+    const data = this.syncNotificationsForUser(userId)
+    return this.buildNotificationsPayload(data, userId)
+  }
+
+  markNotificationRead(userId: string, notificationId: string): NotificationsScreenPayload {
+    const data = this.database.update((current) => {
+      const currentUser = this.ensureCurrentUser(current, userId)
+      this.syncNotificationsForUserInData(current, currentUser)
+      const notification = current.notifications.find((item) => item.id === notificationId && item.userId === userId)
+      if (!notification) throw new NotFoundException('Notificacao nao encontrada.')
+      if (!notification.readAt) {
+        const now = new Date().toISOString()
+        notification.readAt = now
+        notification.updatedAt = now
+      }
+    })
+
+    return this.buildNotificationsPayload(data, userId)
+  }
+
+  markNotificationUnread(userId: string, notificationId: string): NotificationsScreenPayload {
+    const data = this.database.update((current) => {
+      const currentUser = this.ensureCurrentUser(current, userId)
+      this.syncNotificationsForUserInData(current, currentUser)
+      const notification = current.notifications.find((item) => item.id === notificationId && item.userId === userId)
+      if (!notification) throw new NotFoundException('Notificacao nao encontrada.')
+      if (notification.readAt) {
+        notification.readAt = null
+        notification.updatedAt = new Date().toISOString()
+      }
+    })
+
+    return this.buildNotificationsPayload(data, userId)
+  }
+
+  markAllNotificationsRead(userId: string): NotificationsScreenPayload {
+    const data = this.database.update((current) => {
+      const currentUser = this.ensureCurrentUser(current, userId)
+      this.syncNotificationsForUserInData(current, currentUser)
+      const now = new Date().toISOString()
+
+      for (const notification of current.notifications) {
+        if (notification.userId !== userId || notification.readAt) continue
+        notification.readAt = now
+        notification.updatedAt = now
+      }
+    })
+
+    return this.buildNotificationsPayload(data, userId)
   }
 
   getEvaluationsScreen(userId: string) {
     const data = this.database.read()
-    this.ensureCurrentUser(data, userId)
+    const currentUser = this.ensureCurrentUser(data, userId)
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const scopedClassIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+    const scopedEvaluationIds = new Set(data.evaluations.filter((evaluation) => scopedClassIds.has(evaluation.classId)).map((evaluation) => evaluation.id))
 
     return {
-      evaluations: data.evaluations,
-      classes: data.classes,
+      evaluations: data.evaluations.filter((evaluation) => scopedClassIds.has(evaluation.classId)),
+      classes: scoped.classes,
+      students: scoped.students,
+      teachers: scoped.teachers,
+      schools: scoped.schools,
+      evaluationCorrections: data.evaluationCorrections.filter((correction) => scopedEvaluationIds.has(correction.evaluationId)),
       curriculumBases: data.curriculumBases,
       curriculumSkills: data.curriculumSkills,
       assessmentPrograms: data.assessmentPrograms,
       assessmentMatrices: data.assessmentMatrices,
       assessmentDescriptors: data.assessmentDescriptors,
-      questionBank: data.questions,
+      questionBank: data.questions.filter((question) => this.canUseQuestionInSelection(question, currentUser, roleCode)),
       questionImportPlans: data.questionImportPlans,
     }
   }
@@ -271,6 +463,7 @@ export class LiensinaService {
 
     return {
       calendarEvents: data.calendarEvents,
+      roomReservations: data.roomReservations,
       schools: data.schools,
       classes: data.classes,
       evaluations: data.evaluations,
@@ -278,16 +471,26 @@ export class LiensinaService {
   }
 
   getMealsScreen(userId: string) {
+    this.ensureMealManagementDataReady(userId)
+
     const data = this.database.read()
     const currentUser = this.ensureCurrentUser(data, userId)
-    const managements = currentUser.schoolId
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
+    const canViewAll = roleCode === 'ADMIN' || roleCode === 'NUTRITIONIST'
+    const managements = currentUser.schoolId && !canViewAll
       ? data.mealManagements.filter((management) => management.escolaId === currentUser.schoolId)
       : data.mealManagements
     const schoolIds = new Set(managements.map((management) => management.escolaId))
+    const foodRequests = canViewAll
+      ? data.mealFoodRequests
+      : data.mealFoodRequests.filter((request) => currentUser.schoolId && request.schoolId === currentUser.schoolId)
+    const requestIds = new Set(foodRequests.map((request) => request.id))
 
     return {
-      schools: data.schools.filter((school) => schoolIds.has(school.id) || !currentUser.schoolId),
+      schools: data.schools.filter((school) => schoolIds.has(school.id) || canViewAll),
       mealManagements: managements,
+      foodRequests,
+      mealRequestHistory: data.mealRequestHistory.filter((entry) => requestIds.has(entry.entityId)),
     }
   }
 
@@ -295,23 +498,36 @@ export class LiensinaService {
     return this.getMealsScreen(userId)
   }
 
-  listMealManagementSchoolPage(userId: string, rawPage: string | number = 1, rawLimit: string | number = 5) {
+  listMealManagementSchoolPage(userId: string, rawPage: string | number = 1, rawLimit: string | number = 5, search = '') {
+    this.ensureMealManagementDataReady(userId)
+
     const data = this.database.read()
     const currentUser = this.ensureCurrentUser(data, userId)
     const page = Math.max(1, Number(rawPage) || 1)
     const limit = Math.min(20, Math.max(1, Number(rawLimit) || 5))
-    const managements = currentUser.schoolId
-      ? data.mealManagements.filter((management) => management.escolaId === currentUser.schoolId)
-      : data.mealManagements
-    const total = managements.length
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
+    const canViewAll = roleCode === 'ADMIN' || roleCode === 'NUTRITIONIST'
+    const query = this.normalizeTextKey(search)
+    const managementBySchoolId = new Map<string, MealManagement>()
+    for (const management of data.mealManagements) {
+      if (!managementBySchoolId.has(management.escolaId)) managementBySchoolId.set(management.escolaId, management)
+    }
+    const schools = data.schools.filter((school) => {
+      if (currentUser.schoolId && !canViewAll && school.id !== currentUser.schoolId) return false
+      if (!query) return true
+      return this.normalizeTextKey([school.name, school.director, school.address].filter(Boolean).join(' ')).includes(query)
+    })
+    const total = schools.length
     const totalPages = Math.max(1, Math.ceil(total / limit))
     const safePage = Math.min(page, totalPages)
     const start = (safePage - 1) * limit
-    const pageManagements = managements.slice(start, start + limit)
-    const schoolIds = new Set(pageManagements.map((management) => management.escolaId))
+    const pageSchools = schools.slice(start, start + limit)
+    const pageManagements = pageSchools
+      .map((school) => managementBySchoolId.get(school.id))
+      .filter((management): management is MealManagement => Boolean(management))
 
     return {
-      schools: data.schools.filter((school) => schoolIds.has(school.id)),
+      schools: pageSchools,
       mealManagements: pageManagements,
       pagination: {
         page: safePage,
@@ -534,23 +750,301 @@ export class LiensinaService {
     return updated!
   }
 
+  createMealFoodRequest(actorId: string, payload: CreateMealFoodRequestPayload) {
+    let created: MealFoodRequest | null = null
+
+    this.database.update((data) => {
+      const actor = this.ensureCurrentUser(data, actorId)
+      const roleCode = this.getCurrentRoleCode(data, actor)
+      if (roleCode !== 'ADMIN' && roleCode !== 'DIRETOR') {
+        throw new ForbiddenException('Apenas Diretor ou Admin podem criar solicitacoes de alimentos.')
+      }
+
+      const schoolId = this.resolveFoodRequestSchoolId(data, actor, roleCode, payload.schoolId)
+      const now = new Date().toISOString()
+      created = this.buildMealFoodRequest(data, payload, schoolId, actorId, now)
+      data.mealFoodRequests.unshift(created)
+      this.pushMealRequestHistory(data, actor, 'CREATED_FOOD_REQUEST', created, null, created, `Criou solicitacao de ${created.quantity} ${created.unit} de ${created.itemName}`)
+      this.pushAudit(data, actorId, 'Criou solicitacao de alimento', created.itemName)
+    })
+
+    return created!
+  }
+
+  updateMealFoodRequest(actorId: string, requestId: string, payload: UpdateMealFoodRequestPayload) {
+    let updated: MealFoodRequest | null = null
+
+    this.database.update((data) => {
+      const actor = this.ensureCurrentUser(data, actorId)
+      const roleCode = this.getCurrentRoleCode(data, actor)
+      const index = data.mealFoodRequests.findIndex((request) => request.id === requestId)
+      if (index < 0) throw new NotFoundException('Solicitacao de alimento nao encontrada.')
+
+      const current = data.mealFoodRequests[index]
+      const isCreator = current.requestedBy === actorId
+      const canCreatorUpdate = isCreator && this.canCreatorMutateMealFoodRequest(current.status)
+      if (roleCode !== 'ADMIN') {
+        if (!canCreatorUpdate) throw new ForbiddenException('Apenas o criador pode editar solicitacoes pendentes, reprovadas ou que precisam de ajuste.')
+        if (current.schoolId !== actor.schoolId) throw new ForbiddenException('Usuario so pode editar solicitacoes da propria escola.')
+      }
+
+      const schoolId = this.resolveFoodRequestSchoolId(data, actor, roleCode, payload.schoolId ?? current.schoolId)
+      const now = new Date().toISOString()
+      const shouldResendToNutritionist = roleCode !== 'ADMIN' && canCreatorUpdate
+      updated = this.buildMealFoodRequest(data, { ...current, ...payload }, schoolId, current.requestedBy, current.createdAt, current.id)
+      updated = {
+        ...updated,
+        status: shouldResendToNutritionist ? 'PENDING_NUTRITIONIST_APPROVAL' : (payload as Partial<MealFoodRequest>).status ?? current.status,
+        reviewedBy: shouldResendToNutritionist ? null : current.reviewedBy ?? null,
+        reviewedAt: shouldResendToNutritionist ? null : current.reviewedAt ?? null,
+        nutritionistObservation: shouldResendToNutritionist ? null : current.nutritionistObservation ?? null,
+        rejectionReason: shouldResendToNutritionist ? null : current.rejectionReason ?? null,
+        suggestedQuantity: shouldResendToNutritionist ? null : current.suggestedQuantity ?? null,
+        suggestedUnit: shouldResendToNutritionist ? null : current.suggestedUnit ?? null,
+        suggestedUnitPrice: shouldResendToNutritionist ? null : current.suggestedUnitPrice ?? null,
+        confirmedBy: current.confirmedBy ?? null,
+        confirmedAt: current.confirmedAt ?? null,
+        supplierName: current.supplierName ?? null,
+        purchaseValue: current.purchaseValue ?? null,
+        purchaseDate: current.purchaseDate ?? null,
+        stockItemId: current.stockItemId ?? null,
+        updatedAt: now,
+      }
+
+      data.mealFoodRequests[index] = updated
+      this.pushMealRequestHistory(data, actor, 'UPDATED_FOOD_REQUEST', updated, current, updated, `Editou solicitacao de ${updated.itemName}`)
+      this.pushAudit(data, actorId, 'Editou solicitacao de alimento', updated.itemName)
+    })
+
+    return updated!
+  }
+
+  deleteMealFoodRequest(actorId: string, requestId: string) {
+    let updated: MealFoodRequest | null = null
+
+    this.database.update((data) => {
+      const actor = this.ensureCurrentUser(data, actorId)
+      const roleCode = this.getCurrentRoleCode(data, actor)
+      const index = data.mealFoodRequests.findIndex((request) => request.id === requestId)
+      if (index < 0) throw new NotFoundException('Solicitacao de alimento nao encontrada.')
+
+      const current = data.mealFoodRequests[index]
+      const isCreator = current.requestedBy === actorId
+      if (roleCode !== 'ADMIN') {
+        if (!isCreator) throw new ForbiddenException('Apenas o criador pode excluir esta solicitacao.')
+        if (current.schoolId !== actor.schoolId) throw new ForbiddenException('Usuario so pode excluir solicitacoes da propria escola.')
+        if (!this.canCreatorMutateMealFoodRequest(current.status)) {
+          throw new BadRequestException('Solicitacao nao pode mais ser excluida pelo criador.')
+        }
+      }
+
+      if (current.status === 'ADDED_TO_STOCK' || current.status === 'PURCHASED') {
+        throw new BadRequestException('Solicitacao ja finalizada nao pode ser excluida.')
+      }
+
+      updated = {
+        ...current,
+        status: 'CANCELLED',
+        updatedAt: new Date().toISOString(),
+      }
+
+      data.mealFoodRequests[index] = updated
+      this.pushMealRequestHistory(data, actor, 'CANCELLED_FOOD_REQUEST', updated, current, updated, `Cancelou solicitacao de ${updated.itemName}`)
+      this.pushAudit(data, actorId, 'Cancelou solicitacao de alimento', updated.itemName)
+    })
+
+    return updated!
+  }
+
+  reviewMealFoodRequest(actorId: string, requestId: string, payload: ReviewMealFoodRequestPayload) {
+    let updated: MealFoodRequest | null = null
+
+    this.database.update((data) => {
+      const actor = this.ensureCurrentUser(data, actorId)
+      const roleCode = this.getCurrentRoleCode(data, actor)
+      if (roleCode !== 'ADMIN' && roleCode !== 'NUTRITIONIST') {
+        throw new ForbiddenException('Apenas Nutricionista ou Admin podem avaliar solicitacoes.')
+      }
+
+      const index = data.mealFoodRequests.findIndex((request) => request.id === requestId)
+      if (index < 0) throw new NotFoundException('Solicitacao de alimento nao encontrada.')
+      const current = data.mealFoodRequests[index]
+      if (current.status === 'ADDED_TO_STOCK' || current.status === 'CANCELLED') {
+        throw new BadRequestException('Esta solicitacao nao pode mais ser avaliada.')
+      }
+
+      const action = String(payload.action ?? '').trim().toUpperCase()
+      const now = new Date().toISOString()
+      const suggestedUnitPrice = payload.suggestedUnitPrice === undefined || payload.suggestedUnitPrice === null || payload.suggestedUnitPrice === 0 ? null : Number(payload.suggestedUnitPrice)
+      const base: MealFoodRequest = {
+        ...current,
+        reviewedBy: actorId,
+        reviewedAt: now,
+        updatedAt: now,
+        nutritionistObservation: payload.nutritionistObservation ? String(payload.nutritionistObservation).trim() : null,
+        rejectionReason: null,
+        suggestedQuantity: payload.suggestedQuantity === undefined || payload.suggestedQuantity === null || payload.suggestedQuantity === 0 ? null : Number(payload.suggestedQuantity),
+        suggestedUnit: payload.suggestedUnit ? this.normalizeMealUnit(payload.suggestedUnit) : null,
+        suggestedUnitPrice,
+      }
+
+      if (suggestedUnitPrice !== null && (!Number.isFinite(suggestedUnitPrice) || suggestedUnitPrice <= 0)) {
+        throw new BadRequestException('Valor unitario sugerido deve ser maior que zero.')
+      }
+
+      let historyAction: MealRequestHistoryAction = 'APPROVED_FOOD_REQUEST'
+      if (action === 'APPROVE') {
+        const approvedRequest: MealFoodRequest = { ...base, status: 'APPROVED_BY_NUTRITIONIST' }
+        const stockResult = this.addFoodRequestToMealStock(data, approvedRequest, actorId, {}, { createMenu: true, automaticApproval: true })
+        updated = stockResult.request
+      } else if (action === 'REJECT') {
+        const rejectionReason = String(payload.rejectionReason ?? '').trim()
+        if (!rejectionReason) throw new BadRequestException('Informe o motivo da reprovacao.')
+        updated = { ...base, status: 'REJECTED_BY_NUTRITIONIST', rejectionReason }
+        historyAction = 'REJECTED_FOOD_REQUEST'
+      } else if (action === 'REQUEST_ADJUSTMENT') {
+        const observation = String(payload.nutritionistObservation ?? '').trim()
+        if (!observation) throw new BadRequestException('Informe a observacao do ajuste solicitado.')
+        updated = { ...base, status: 'NEEDS_ADJUSTMENT', nutritionistObservation: observation }
+        historyAction = 'REQUESTED_FOOD_ADJUSTMENT'
+      } else {
+        throw new BadRequestException('Ação de avaliação inválida.')
+      }
+
+      data.mealFoodRequests[index] = updated
+      if (action === 'APPROVE') {
+        this.pushMealRequestHistory(data, actor, 'APPROVED_FOOD_REQUEST', updated, current, updated, this.describeFoodRequestHistory('APPROVED_FOOD_REQUEST', updated))
+        this.pushMealRequestHistory(data, actor, 'ADDED_FOOD_REQUEST_TO_STOCK', updated, current, updated, `Solicitacao aprovada entrou automaticamente no estoque e no cardapio: ${updated.itemName}`)
+        this.pushAudit(data, actorId, 'Aprovou solicitacao e gerou estoque/cardapio', updated.itemName)
+      } else {
+        this.pushMealRequestHistory(data, actor, historyAction, updated, current, updated, this.describeFoodRequestHistory(historyAction, updated))
+        this.pushAudit(data, actorId, 'Avaliou solicitacao de alimento', updated.itemName)
+      }
+    })
+
+    return updated!
+  }
+
+  addMealFoodRequestToStock(actorId: string, requestId: string, payload: AddMealFoodRequestToStockPayload) {
+    let result: { request: MealFoodRequest; management: MealManagement; food: MealFood; quantity: number } | null = null
+
+    this.database.update((data) => {
+      const actor = this.ensureRole(data, actorId, 'ADMIN')
+      const requestIndex = data.mealFoodRequests.findIndex((request) => request.id === requestId)
+      if (requestIndex < 0) throw new NotFoundException('Solicitacao de alimento nao encontrada.')
+      const current = data.mealFoodRequests[requestIndex]
+      if (current.status === 'ADDED_TO_STOCK' || current.status === 'CANCELLED') {
+        throw new BadRequestException('Esta solicitacao nao pode virar uma nova entrada no estoque.')
+      }
+
+      result = this.addFoodRequestToMealStock(data, current, actorId, payload)
+      data.mealFoodRequests[requestIndex] = result.request
+      this.pushMealRequestHistory(data, actor, 'ADDED_FOOD_REQUEST_TO_STOCK', result.request, current, result.request, `Admin adicionou ${result.quantity} ${result.food.unidadeMedida} de ${result.food.nome} ao estoque`)
+      this.pushAudit(data, actorId, 'Adicionou solicitacao ao estoque', result.food.nome)
+    })
+
+    return result!
+  }
+
   getAccessScreen(userId: string) {
     const data = this.database.read()
     this.ensureCurrentUser(data, userId)
 
     return {
       roles: data.roles,
-      users: data.users.map((user) => this.toPublicUser(user)),
+      users: data.users.map((user) => this.toPublicUserWithResolvedSchool(data, user)),
       schools: data.schools,
     }
+  }
+
+  searchAccessUsers(userId: string, search = '', schoolId = 'all', kind = 'all', rawLimit: string | number = 10) {
+    const data = this.database.read()
+    this.ensureRole(data, userId, 'ADMIN')
+
+    const query = this.normalizeTextKey(search)
+    const schoolFilter = String(schoolId ?? 'all').trim()
+    const kindFilter = this.normalizeTextKey(kind)
+    const limit = Math.min(25, Math.max(1, Number(rawLimit) || 10))
+    const rolesById = new Map(data.roles.map((role) => [role.id, role]))
+    const schoolById = new Map(data.schools.map((school) => [school.id, school]))
+
+    if (!query) return { users: [] }
+
+    const getUserKind = (user: UserAccount): 'professor' | 'coordenador' | 'responsavel' | 'aluno' | 'outro' => {
+      const role = rolesById.get(user.roleId)
+      const roleText = this.normalizeTextKey(`${role?.code ?? ''} ${role?.name ?? ''} ${role?.description ?? ''}`).replace(/[^a-z0-9]/g, '')
+
+      if (user.linkedTeacherId || roleText.includes('professor')) return 'professor'
+      if (roleText.includes('coorden') || roleText.includes('pedagog')) return 'coordenador'
+      if (user.linkedGuardianId || roleText.includes('responsavel') || roleText.includes('responsaveis')) return 'responsavel'
+      if (user.linkedStudentId || roleText.includes('aluno')) return 'aluno'
+      return 'outro'
+    }
+
+    const getScore = (user: UserAccount) => {
+      const role = rolesById.get(user.roleId)
+      const school = user.schoolId ? schoolById.get(user.schoolId) : null
+      const userKind = getUserKind(user)
+      const fields = [
+        { value: user.name, weight: 90 },
+        { value: user.email, weight: 62 },
+        { value: user.login ?? '', weight: 52 },
+        { value: user.phone ?? '', weight: 36 },
+        { value: role?.name ?? '', weight: 28 },
+        { value: role?.code ?? '', weight: 24 },
+        { value: school?.name ?? '', weight: 22 },
+        { value: school?.city ?? '', weight: 14 },
+        { value: userKind, weight: 18 },
+      ]
+
+      return fields.reduce((best, field) => {
+        const value = this.normalizeTextKey(field.value)
+        if (!value) return best
+        if (value === query) return Math.max(best, field.weight + 70)
+        if (value.startsWith(query)) return Math.max(best, field.weight + 40)
+        if (value.includes(query)) return Math.max(best, field.weight + 22)
+        if (value.split(/\s+/).some((word) => word.startsWith(query))) return Math.max(best, field.weight + 32)
+        return best
+      }, 0)
+    }
+
+    const users = data.users
+      .filter((user) => {
+        if (schoolFilter && schoolFilter !== 'all') {
+          if (schoolFilter === 'network') {
+            if (user.schoolId) return false
+          } else if (user.schoolId !== schoolFilter) {
+            return false
+          }
+        }
+
+        if (kindFilter && kindFilter !== 'all' && getUserKind(user) !== kindFilter) return false
+        return true
+      })
+      .map((user) => ({ user, score: getScore(user) }))
+      .filter((result) => result.score > 0)
+      .sort((first, second) => second.score - first.score || first.user.name.localeCompare(second.user.name))
+      .slice(0, limit)
+      .map((result) => this.toPublicUserWithResolvedSchool(data, result.user))
+
+    return { users }
   }
 
   getSettingsScreen(userId: string) {
     const data = this.database.read()
     const currentUser = this.ensureCurrentUser(data, userId)
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const currentUserPayload = this.toPublicUserWithResolvedSchool(data, currentUser)
+    const linkedSchool = currentUserPayload.schoolId
+      ? data.schools.find((school) => school.id === currentUserPayload.schoolId)
+      : null
+    const schools = linkedSchool && !scoped.schools.some((school) => school.id === linkedSchool.id)
+      ? [linkedSchool, ...scoped.schools]
+      : scoped.schools
 
     return {
-      currentUser: this.toPublicUser(currentUser),
+      currentUser: currentUserPayload,
+      schools,
     }
   }
 
@@ -567,6 +1061,7 @@ export class LiensinaService {
     }
     this.database.update((data) => {
       data.schools.unshift(school)
+      this.createMissingMealManagements(data, this.getCurrentReferenceMonth(), actorId)
       this.pushAudit(data, actorId, 'Criou escola', school.name)
     })
     return school
@@ -590,7 +1085,7 @@ export class LiensinaService {
     const classRoom: ClassRoom = {
       id: this.createId('turma'),
       name: payload.name!.trim(),
-      grade: payload.grade!.trim(),
+      grade: this.normalizeClassGrade(payload.grade),
       shift: payload.shift ?? 'Manha',
       schoolId: payload.schoolId!,
       teacherId: payload.teacherId!,
@@ -621,7 +1116,10 @@ export class LiensinaService {
       if (!teacherIds.every((item) => data.teachers.some((teacher) => teacher.id === item && teacher.schoolId === schoolId))) {
         throw new BadRequestException('Todos os professores da turma precisam pertencer a escola selecionada.')
       }
-      updated = { ...data.classes[index], ...payload, id, teacherId, teacherIds }
+      const normalizedPayload = payload.grade === undefined
+        ? payload
+        : { ...payload, grade: this.normalizeClassGrade(payload.grade) }
+      updated = { ...data.classes[index], ...normalizedPayload, id, teacherId, teacherIds }
       data.classes[index] = updated
       this.pushAudit(data, actorId, 'Atualizou turma', updated.name)
     })
@@ -911,30 +1409,106 @@ export class LiensinaService {
 
   createEvaluation(actorId: string, payload: Partial<Evaluation>) {
     this.ensureRequired(payload, ['title', 'classId', 'subject', 'scheduledAt'])
-    const evaluation: Evaluation = {
-      id: this.createId('sim'),
-      title: payload.title!.trim(),
-      classId: payload.classId!,
-      subject: payload.subject!.trim(),
-      questions: payload.questions ?? 20,
-      scheduledAt: payload.scheduledAt!,
-      status: payload.status ?? 'planejado',
-      corrected: payload.corrected ?? 0,
-      participants: payload.participants ?? 0,
-      averageScore: payload.averageScore ?? 0,
-      triLevel: payload.triLevel ?? 'Aguardando aplicacao',
-      buildMode: payload.buildMode,
-      questionIds: Array.isArray(payload.questionIds) ? payload.questionIds : [],
-      skillCodes: Array.isArray(payload.skillCodes) ? payload.skillCodes : [],
-      descriptorCodes: Array.isArray(payload.descriptorCodes) ? payload.descriptorCodes : [],
-      sourceSummary: payload.sourceSummary,
-    }
+    let evaluation: Evaluation | null = null
+
     this.database.update((data) => {
-      this.ensureQuestionIdsExist(data, evaluation.questionIds ?? [])
+      const actor = this.ensureCurrentUser(data, actorId)
+      const questionIds = Array.isArray(payload.questionIds) ? payload.questionIds : []
+      this.ensureQuestionIdsExist(data, questionIds)
+      const payloadSnapshots = Array.isArray(payload.questionSnapshots) ? payload.questionSnapshots : []
+      const questionSnapshots = questionIds
+        .map((questionId) => data.questions.find((question) => question.id === questionId) ?? payloadSnapshots.find((question) => question.id === questionId))
+        .filter((question): question is Question => Boolean(question))
+
+      evaluation = {
+        id: this.createId('sim'),
+        title: payload.title!.trim(),
+        classId: payload.classId!,
+        subject: payload.subject!.trim(),
+        questions: payload.questions ?? 20,
+        scheduledAt: payload.scheduledAt!,
+        status: payload.status ?? 'planejado',
+        corrected: payload.corrected ?? 0,
+        participants: payload.participants ?? 0,
+        averageScore: payload.averageScore ?? 0,
+        triLevel: payload.triLevel ?? 'Aguardando aplicacao',
+        buildMode: payload.buildMode,
+        questionIds,
+        questionSnapshots,
+        skillCodes: Array.isArray(payload.skillCodes) ? payload.skillCodes : [],
+        descriptorCodes: Array.isArray(payload.descriptorCodes) ? payload.descriptorCodes : [],
+        sourceSummary: payload.sourceSummary,
+        createdById: actor.id,
+        createdByName: actor.name,
+        createdBy: {
+          id: actor.id,
+          name: actor.name,
+          email: actor.email,
+        },
+      }
       data.evaluations.unshift(evaluation)
       this.pushAudit(data, actorId, 'Criou prova', evaluation.title)
     })
-    return evaluation
+    return evaluation!
+  }
+
+  async getEvaluationDownload(actorId: string, id: string): Promise<EvaluationDownloadFile> {
+    const data = this.database.read()
+    const actor = this.ensureCurrentUser(data, actorId)
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (!['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) {
+      throw new ForbiddenException('Seu perfil nao pode baixar provas.')
+    }
+
+    let evaluation = data.evaluations.find((item) => item.id === id)
+    if (!evaluation) throw new NotFoundException('Prova nao encontrada.')
+    if (!this.canAccessEvaluation(data, actor, evaluation)) {
+      throw new ForbiddenException('Seu perfil nao pode baixar esta prova.')
+    }
+
+    let questions = this.resolveEvaluationQuestions(data, evaluation)
+
+    if (!questions.length && Number(evaluation.questions) > 0) {
+      const updatedData = this.database.update((current) => {
+        const currentActor = this.ensureCurrentUser(current, actorId)
+        const currentEvaluationIndex = current.evaluations.findIndex((item) => item.id === id)
+        if (currentEvaluationIndex < 0) throw new NotFoundException('Prova nao encontrada.')
+        const currentEvaluation = current.evaluations[currentEvaluationIndex]
+        if (!this.canAccessEvaluation(current, currentActor, currentEvaluation)) {
+          throw new ForbiddenException('Seu perfil nao pode baixar esta prova.')
+        }
+
+        const selectedQuestions = this.selectLegacyEvaluationQuestions(current, currentEvaluation, currentActor)
+        if (!selectedQuestions.length) return
+
+        current.evaluations[currentEvaluationIndex] = {
+          ...currentEvaluation,
+          questionIds: selectedQuestions.map((question) => question.id),
+        }
+        this.pushAudit(current, actorId, 'Vinculou questoes a prova legada', currentEvaluation.title)
+      })
+
+      evaluation = updatedData.evaluations.find((item) => item.id === id) ?? evaluation
+      questions = this.resolveEvaluationQuestions(updatedData, evaluation)
+    }
+
+    const classRoom = data.classes.find((item) => item.id === evaluation.classId)
+    const uploadsRoot = resolve(process.cwd(), 'uploads')
+    const exportsDir = join(uploadsRoot, 'evaluations')
+    mkdirSync(exportsDir, { recursive: true })
+
+    const filename = `${this.safeDownloadSlug(evaluation.title || 'prova')}-${evaluation.id}.pdf`
+    const filePath = join(exportsDir, filename)
+    const tempPath = join(exportsDir, `.${filename}.${randomUUID()}.tmp`)
+
+    await writeEvaluationPdfFile({ evaluation, classRoom, questions, uploadsRoot }, tempPath)
+    renameSync(tempPath, filePath)
+
+    return {
+      filePath,
+      filename,
+      contentType: 'application/pdf',
+    }
   }
 
   deleteEvaluation(actorId: string, id: string) {
@@ -947,6 +1521,110 @@ export class LiensinaService {
     })
 
     return { success: true }
+  }
+
+  async processEvaluationOmrCorrection(actorId: string, evaluationId: string, studentId: string, file: OmrImageFile) {
+    if (!file) throw new BadRequestException('Envie a imagem ou PDF do cartao resposta.')
+    const isSupportedFile = file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf'
+    if (!isSupportedFile) throw new BadRequestException('Envie uma imagem ou PDF valido do cartao resposta.')
+
+    const snapshot = this.database.read()
+    const actor = this.ensureCurrentUser(snapshot, actorId)
+    const evaluation = snapshot.evaluations.find((item) => item.id === evaluationId)
+    if (!evaluation) throw new NotFoundException('Prova nao encontrada.')
+    if (!this.canAccessEvaluation(snapshot, actor, evaluation)) throw new ForbiddenException('Sem acesso a esta prova.')
+
+    const classRoom = snapshot.classes.find((item) => item.id === evaluation.classId)
+    if (!classRoom) throw new BadRequestException('Turma da prova nao encontrada.')
+    const student = snapshot.students.find((item) => item.id === studentId)
+    if (!student || student.classId !== classRoom.id) throw new BadRequestException('Aluno nao pertence a turma da prova.')
+
+    const questions = this.resolveEvaluationQuestions(snapshot, evaluation)
+    if (!questions.length) throw new BadRequestException('Esta prova nao possui questoes vinculadas para correcao.')
+    const answerKey = this.buildEvaluationAnswerKey(questions)
+    const imageObject = this.saveEvaluationCorrectionImage(evaluationId, studentId, file)
+    const answerCardId = this.createId('answer-card')
+    const omrPayload = {
+      examId: evaluation.id,
+      versionId: this.getEvaluationVersionId(evaluation),
+      answerCardId,
+      studentId,
+      classId: classRoom.id,
+      templateVersion: 'liensina-omr-v1',
+      answerKey,
+    }
+    const omrResponse = await this.requestOmrCorrection(file, omrPayload)
+    const now = new Date().toISOString()
+    const correction: EvaluationCorrection = {
+      id: this.createId('evaluation-correction'),
+      evaluationId: evaluation.id,
+      classId: classRoom.id,
+      studentId,
+      status: omrResponse.shouldRetakeImage ? 'NEEDS_RETAKE' : 'SUGGESTED',
+      imageUrl: imageObject.publicUrl,
+      imageObject,
+      suggestedScore: this.toScore(omrResponse.suggestedScore),
+      finalScore: null,
+      correctCount: Number(omrResponse.correctCount) || 0,
+      wrongCount: Number(omrResponse.wrongCount) || 0,
+      blankCount: Number(omrResponse.blankCount) || 0,
+      multipleCount: Number(omrResponse.multipleCount) || 0,
+      totalQuestions: Number(omrResponse.totalQuestions) || answerKey.length,
+      confidence: this.toConfidence(omrResponse.confidence),
+      requiresReview: true,
+      shouldRetakeImage: Boolean(omrResponse.shouldRetakeImage),
+      failures: Array.isArray(omrResponse.failures) ? omrResponse.failures.map(String) : [],
+      detectedAnswers: this.normalizeCorrectionAnswers(omrResponse.detectedAnswers, answerKey),
+      answerKey,
+      rawOmrResponse: omrResponse,
+      teacherNotes: null,
+      reviewedById: null,
+      reviewedAt: null,
+      createdById: actorId,
+      createdAt: now,
+      updatedAt: now,
+    }
+
+    this.database.update((data) => {
+      const existingIndex = data.evaluationCorrections.findIndex((item) => item.evaluationId === evaluationId && item.studentId === studentId)
+      if (existingIndex >= 0) data.evaluationCorrections[existingIndex] = correction
+      else data.evaluationCorrections.unshift(correction)
+      this.pushAudit(data, actorId, 'Gerou sugestao de correcao OMR', `${evaluation.title} - ${student.name}`)
+    })
+
+    return correction
+  }
+
+  reviewEvaluationCorrection(actorId: string, correctionId: string, payload: EvaluationCorrectionReviewPayload) {
+    let updated: EvaluationCorrection | null = null
+
+    this.database.update((data) => {
+      const actor = this.ensureCurrentUser(data, actorId)
+      const correction = data.evaluationCorrections.find((item) => item.id === correctionId)
+      if (!correction) throw new NotFoundException('Correcao nao encontrada.')
+      const evaluation = data.evaluations.find((item) => item.id === correction.evaluationId)
+      if (!evaluation) throw new NotFoundException('Prova da correcao nao encontrada.')
+      if (!this.canAccessEvaluation(data, actor, evaluation)) throw new ForbiddenException('Sem acesso a esta correcao.')
+
+      const status = payload.status ?? 'CONFIRMED'
+      correction.status = status
+      correction.finalScore = status === 'CONFIRMED'
+        ? this.toScore(payload.finalScore ?? correction.suggestedScore)
+        : payload.finalScore == null ? null : this.toScore(payload.finalScore)
+      correction.detectedAnswers = Array.isArray(payload.detectedAnswers)
+        ? payload.detectedAnswers
+        : correction.detectedAnswers
+      correction.teacherNotes = payload.teacherNotes == null ? correction.teacherNotes : String(payload.teacherNotes).slice(0, 1200)
+      correction.reviewedById = actorId
+      correction.reviewedAt = new Date().toISOString()
+      correction.updatedAt = correction.reviewedAt
+
+      this.recalculateEvaluationCorrectionSummary(data, correction.evaluationId)
+      this.pushAudit(data, actorId, 'Revisou correcao de prova', evaluation.title)
+      updated = { ...correction }
+    })
+
+    return updated!
   }
 
   createQuestion(actorId: string, payload: CreateQuestionRequest & { status?: QuestionStatus }) {
@@ -970,7 +1648,6 @@ export class LiensinaService {
       })
 
       if (!skills.length) throw new BadRequestException('Informe pelo menos uma habilidade.')
-      if (!descriptors.length) throw new BadRequestException('Informe pelo menos um descritor.')
 
       const options = (payload.options ?? []).map((option, index) => ({
         id: this.createId('question-option'),
@@ -1028,17 +1705,85 @@ export class LiensinaService {
               questionId,
               reviewerId: actor.id,
               status: 'APPROVED',
-              comment: 'Questao aprovada no cadastro.',
+              comment: 'Questão aprovada no cadastro.',
               reviewedAt: now,
             }]
           : [],
       }
 
       data.questions.unshift(created)
-      this.pushAudit(data, actorId, 'Criou questao', created.title)
+      this.pushAudit(data, actorId, 'Criou questão', created.title)
     })
 
     return created!
+  }
+
+  deleteQuestion(actorId: string, id: string) {
+    this.database.update((data) => {
+      this.ensureCurrentUser(data, actorId)
+      const index = data.questions.findIndex((question) => question.id === id)
+      if (index < 0) throw new NotFoundException('Questão não encontrada.')
+
+      const question = data.questions[index]
+      if (question.sourceType !== 'TEACHER_CREATED' || !question.isEditable) {
+        throw new ForbiddenException('Somente questoes criadas pelo professor podem ser excluidas.')
+      }
+
+      const [removed] = data.questions.splice(index, 1)
+      data.evaluations = data.evaluations.map((evaluation) => (
+        evaluation.questionIds?.includes(id)
+          ? {
+              ...evaluation,
+              questionIds: evaluation.questionIds.filter((questionId) => questionId !== id),
+              questions: Math.max(0, evaluation.questionIds.filter((questionId) => questionId !== id).length || evaluation.questions - 1),
+            }
+          : evaluation
+      ))
+      this.pushAudit(data, actorId, 'Removeu questão', removed.title)
+    })
+
+    return { success: true }
+  }
+
+  generateQuestionSelection(actorId: string, payload: GenerateQuestionSelectionRequest): GenerateQuestionSelectionResponse {
+    const requestedQuantity = this.normalizeQuestionQuantity(payload.quantity)
+    const subjectFilter = this.normalizeTextKey(payload.subject)
+    if (!subjectFilter) throw new BadRequestException('Informe a disciplina para gerar questoes.')
+
+    const gradeFilter = this.normalizeSelectionFilter(payload.gradeLevel)
+    const difficultyFilter = this.normalizeSelectionFilter(payload.difficulty)
+    const skillFilter = this.normalizeSelectionFilter(payload.skillCode)
+    const descriptorFilter = this.normalizeSelectionFilter(payload.descriptorCode)
+    const sourceMode = payload.sourceMode === 'enem' || payload.sourceMode === 'mixed' ? payload.sourceMode : 'system'
+    const data = this.database.read()
+    const actor = this.ensureCurrentUser(data, actorId)
+    const roleCode = this.getCurrentRoleCode(data, actor)
+
+    const sourcePool = data.questions.filter((question) => {
+      if (question.status !== 'APPROVED') return false
+      if (!this.canUseQuestionInSelection(question, actor, roleCode)) return false
+      if (sourceMode === 'enem' && question.sourceType !== 'INEP_ENEM') return false
+      if (sourceMode === 'system' && question.sourceType === 'INEP_ENEM') return false
+      if (gradeFilter && !this.questionMatchesGradeFilter(question.gradeLevel, gradeFilter)) return false
+      if (difficultyFilter && this.normalizeTextKey(question.difficulty) !== difficultyFilter) return false
+      if (skillFilter && !question.skills.some((skill) => this.normalizeTextKey(skill.code) === skillFilter)) return false
+      if (descriptorFilter && !question.descriptors.some((descriptor) => this.normalizeTextKey(descriptor.code) === descriptorFilter)) return false
+      return this.questionMatchesSubjectFilter(question, subjectFilter)
+    })
+
+    if (!sourcePool.length) {
+      return { questions: [], questionIds: [], totalEligible: 0 }
+    }
+
+    const selectedQuestions = sourceMode === 'mixed'
+      ? this.buildMixedQuestionSelection(sourcePool, requestedQuantity)
+      : this.shuffleItems(sourcePool).slice(0, requestedQuantity)
+
+    return {
+      questions: selectedQuestions,
+      questionIds: selectedQuestions.map((question) => question.id),
+      totalEligible: sourcePool.length,
+    }
   }
 
   async generateEnemQuestions(actorId: string, payload: GenerateEnemQuestionsRequest): Promise<GenerateEnemQuestionsResponse> {
@@ -1075,7 +1820,7 @@ export class LiensinaService {
     const eligibleQuestions = [...cachedQuestions, ...eligibleFetchedQuestions]
 
     if (eligibleQuestions.length === 0) {
-      throw new BadRequestException('Nenhuma questao do ENEM foi encontrada para os filtros informados.')
+      throw new BadRequestException('Nenhuma questão do ENEM foi encontrada para os filtros informados.')
     }
 
     const selectedQuestions = this.shuffleItems(eligibleQuestions).slice(0, requestedQuantity)
@@ -1202,7 +1947,8 @@ export class LiensinaService {
     let calendarEvent: SchoolCalendarEvent | null = null
 
     this.database.update((data) => {
-      calendarEvent = this.buildCalendarEvent(data, payload)
+      this.ensureCurrentUser(data, actorId)
+      calendarEvent = this.buildCalendarEvent(data, { ...payload, createdById: actorId })
       data.calendarEvents.unshift(calendarEvent)
       this.pushAudit(data, actorId, 'Criou evento no calendario', calendarEvent.title)
     })
@@ -1217,7 +1963,9 @@ export class LiensinaService {
       const index = data.calendarEvents.findIndex((event) => event.id === id)
       if (index < 0) throw new NotFoundException('Evento de calendario nao encontrado.')
 
-      updated = this.buildCalendarEvent(data, { ...data.calendarEvents[index], ...payload, id }, id)
+      const current = data.calendarEvents[index]
+      this.ensureCalendarEventMutationAllowed(data, actorId, current)
+      updated = this.buildCalendarEvent(data, { ...current, ...payload, id, createdById: current.createdById }, id)
       data.calendarEvents[index] = updated
       this.pushAudit(data, actorId, 'Atualizou evento no calendario', updated.title)
     })
@@ -1230,6 +1978,7 @@ export class LiensinaService {
       const index = data.calendarEvents.findIndex((event) => event.id === id)
       if (index < 0) throw new NotFoundException('Evento de calendario nao encontrado.')
 
+      this.ensureCalendarEventMutationAllowed(data, actorId, data.calendarEvents[index])
       const [removed] = data.calendarEvents.splice(index, 1)
       this.pushAudit(data, actorId, 'Removeu evento do calendario', removed.title)
     })
@@ -1237,12 +1986,65 @@ export class LiensinaService {
     return { success: true }
   }
 
+  createRoomReservation(actorId: string, payload: Partial<RoomReservation>) {
+    this.ensureRequired(payload, ['room', 'date', 'startTime', 'endTime', 'classId', 'purpose'])
+    let roomReservation: RoomReservation | null = null
+
+    this.database.update((data) => {
+      const currentUser = this.ensureCurrentUser(data, actorId)
+      const scoped = this.getScopedSchoolsData(data, currentUser)
+      const allowedClassIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+      const classRoom = data.classes.find((item) => item.id === String(payload.classId ?? '').trim())
+
+      if (!classRoom) throw new BadRequestException('Turma informada nao existe.')
+      if (!allowedClassIds.has(classRoom.id)) throw new ForbiddenException('Seu perfil nao pode reservar esta turma.')
+
+      roomReservation = this.buildRoomReservation(data, payload)
+      data.roomReservations.unshift(roomReservation)
+      this.pushAudit(data, actorId, 'Reservou ambiente', `${roomReservation.room} - ${classRoom.name}`)
+    })
+
+    return roomReservation!
+  }
+
+  createLessonRecord(actorId: string, payload: Partial<LessonRecord>) {
+    this.ensureRequired(payload, ['classId', 'subject', 'date', 'time', 'content', 'plan', 'resources', 'activity'])
+    let lessonRecord: LessonRecord | null = null
+
+    this.database.update((data) => {
+      const currentUser = this.ensureCurrentUser(data, actorId)
+      const roleCode = data.roles.find((role) => role.id === currentUser.roleId)?.code
+        ?? data.roles.find((role) => role.id === currentUser.roleId)?.name
+      if (!['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(String(roleCode ?? ''))) {
+        throw new ForbiddenException('Seu perfil nao pode registrar aulas.')
+      }
+
+      const scoped = this.getScopedSchoolsData(data, currentUser)
+      const allowedClassIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+      const classRoom = data.classes.find((item) => item.id === String(payload.classId ?? '').trim())
+
+      if (!classRoom) throw new BadRequestException('Turma informada nao existe.')
+      if (!allowedClassIds.has(classRoom.id)) throw new ForbiddenException('Seu perfil nao pode registrar aula nesta turma.')
+
+      lessonRecord = this.buildLessonRecord(data, payload)
+      data.lessonRecords.unshift(lessonRecord)
+      this.pushAudit(data, actorId, 'Registrou aula', `${lessonRecord.subject} - ${classRoom.name}`)
+    })
+
+    return lessonRecord!
+  }
+
   updateRole(actorId: string, id: string, payload: Partial<Role>) {
     let updated: Role | null = null
     this.database.update((data) => {
       const index = data.roles.findIndex((role) => role.id === id)
       if (index < 0) throw new NotFoundException('Cargo nao encontrado.')
-      updated = { ...data.roles[index], ...payload, id }
+      const roleCode = payload.code ?? data.roles[index].code
+      const deniedPermissions = forbiddenRolePermissions[roleCode] ?? []
+      const permissions = Array.isArray(payload.permissions)
+        ? payload.permissions.filter((permission) => !deniedPermissions.includes(permission))
+        : data.roles[index].permissions.filter((permission) => !deniedPermissions.includes(permission))
+      updated = { ...data.roles[index], ...payload, id, permissions }
       data.roles[index] = updated
       this.pushAudit(data, actorId, 'Atualizou permissoes do cargo', updated.name)
     })
@@ -1251,7 +2053,7 @@ export class LiensinaService {
 
   updateUserRole(actorId: string, id: string, roleId: string) {
     let updated: UserAccount | null = null
-    this.database.update((data) => {
+    const data = this.database.update((data) => {
       if (!data.roles.some((role) => role.id === roleId)) throw new BadRequestException('Cargo informado nao existe.')
       const index = data.users.findIndex((user) => user.id === id)
       if (index < 0) throw new NotFoundException('Usuario nao encontrado.')
@@ -1259,12 +2061,29 @@ export class LiensinaService {
       data.users[index] = updated
       this.pushAudit(data, actorId, 'Alterou cargo do usuario', updated.name)
     })
-    return this.toPublicUser(updated!)
+    return this.toPublicUserWithResolvedSchool(data, updated!)
+  }
+
+  updateUserSchool(actorId: string, id: string, schoolId: string | null | undefined) {
+    let updated: UserAccount | null = null
+    const data = this.database.update((data) => {
+      this.ensureRole(data, actorId, 'ADMIN')
+      const normalizedSchoolId = schoolId === null || schoolId === undefined || String(schoolId).trim() === '' || String(schoolId).trim() === 'network'
+        ? null
+        : String(schoolId).trim()
+      const school = normalizedSchoolId ? this.ensureSchoolExists(data, normalizedSchoolId) : null
+      const index = data.users.findIndex((user) => user.id === id)
+      if (index < 0) throw new NotFoundException('Usuario nao encontrado.')
+      updated = { ...data.users[index], schoolId: normalizedSchoolId }
+      data.users[index] = updated
+      this.pushAudit(data, actorId, 'Alterou escola vinculada do usuario', `${updated.name} - ${school?.name ?? 'Sem escola vinculada'}`)
+    })
+    return this.toPublicUserWithResolvedSchool(data, updated!)
   }
 
   updateProfile(actorId: string, payload: Partial<UserAccount>) {
     let updated: UserAccount | null = null
-    this.database.update((data) => {
+    const data = this.database.update((data) => {
       const index = data.users.findIndex((user) => user.id === actorId)
       if (index < 0) throw new NotFoundException('Usuario nao encontrado.')
       const current = data.users[index]
@@ -1274,45 +2093,133 @@ export class LiensinaService {
         ...profile,
         avatarUrl: payload.avatarUrl ?? current.avatarUrl,
         bannerUrl: payload.bannerUrl ?? current.bannerUrl,
+        avatarObject: payload.avatarObject !== undefined ? payload.avatarObject : current.avatarObject,
+        bannerObject: payload.bannerObject !== undefined ? payload.bannerObject : current.bannerObject,
       }
       data.users[index] = updated
       this.syncLinkedProfile(data, current, updated)
       this.pushAudit(data, actorId, 'Atualizou o proprio perfil', updated.name)
     })
-    return this.toPublicUser(updated!)
+    return this.toPublicUserWithResolvedSchool(data, updated!)
   }
 
   updateProfileAvatar(actorId: string, file: ProfileImageFile) {
     const current = this.getUserById(actorId)
-    const avatarUrl = this.saveProfileImageFile(actorId, file, 'avatars')
-    this.deleteProfileImageFile(current.avatarUrl)
-    return this.updateProfile(actorId, { avatarUrl })
+    const avatarObject = this.saveProfileImageFile(actorId, file, 'avatars')
+    this.deleteProfileImageFile(current.avatarObject ?? current.avatarUrl)
+    return this.updateProfile(actorId, { avatarUrl: avatarObject.publicUrl, avatarObject })
   }
 
   updateProfileBanner(actorId: string, file: ProfileImageFile) {
     const current = this.getUserById(actorId)
-    const bannerUrl = this.saveProfileImageFile(actorId, file, 'banners')
-    this.deleteProfileImageFile(current.bannerUrl)
-    return this.updateProfile(actorId, { bannerUrl })
+    const bannerObject = this.saveProfileImageFile(actorId, file, 'banners')
+    this.deleteProfileImageFile(current.bannerObject ?? current.bannerUrl)
+    return this.updateProfile(actorId, { bannerUrl: bannerObject.publicUrl, bannerObject })
   }
 
   deleteProfileAvatar(actorId: string) {
     const current = this.getUserById(actorId)
-    this.deleteProfileImageFile(current.avatarUrl)
-    return this.updateProfile(actorId, { avatarUrl: '' })
+    this.deleteProfileImageFile(current.avatarObject ?? current.avatarUrl)
+    return this.updateProfile(actorId, { avatarUrl: '', avatarObject: null })
   }
 
   deleteProfileBanner(actorId: string) {
     const current = this.getUserById(actorId)
-    this.deleteProfileImageFile(current.bannerUrl)
-    return this.updateProfile(actorId, { bannerUrl: '' })
+    this.deleteProfileImageFile(current.bannerObject ?? current.bannerUrl)
+    return this.updateProfile(actorId, { bannerUrl: '', bannerObject: null })
   }
 
-  private buildDashboard(data: DatabaseShape = this.database.read()) {
-    const activeStudents = data.students.filter((student) => student.status === 'matriculado')
+  private syncNotificationsForUser(userId: string) {
+    return this.database.update((data) => {
+      const currentUser = this.ensureCurrentUser(data, userId)
+      this.syncNotificationsForUserInData(data, currentUser)
+    })
+  }
+
+  private syncNotificationsForUserInData(data: DatabaseShape, currentUser: UserAccount) {
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const highRiskStudents = scoped.students.filter((student) => student.status === 'matriculado' && student.desempenho === 'Baixo')
+    const now = new Date().toISOString()
+
+    for (const student of highRiskStudents) {
+      const existing = data.notifications.find((notification) => (
+        notification.userId === currentUser.id
+        && notification.sourceType === 'student-risk'
+        && notification.sourceId === student.id
+      ))
+      const title = `${student.name} em risco pedagogico`
+      const description = `Frequencia ${student.attendanceRate}% e media ${student.averageScore.toFixed(1)}. Recomenda-se intervencao da coordenacao.`
+
+      if (existing) {
+        if (existing.title !== title || existing.description !== description || existing.tone !== 'danger') {
+          existing.title = title
+          existing.description = description
+          existing.tone = 'danger'
+          existing.updatedAt = now
+        }
+        continue
+      }
+
+      data.notifications.push({
+        id: this.createId('notification'),
+        userId: currentUser.id,
+        title,
+        description,
+        tone: 'danger',
+        sourceType: 'student-risk',
+        sourceId: student.id,
+        readAt: null,
+        createdAt: now,
+        updatedAt: now,
+      })
+    }
+  }
+
+  private buildNotificationsPayload(data: DatabaseShape, userId: string): NotificationsScreenPayload {
+    const notifications = this.getUserNotifications(data, userId)
+
+    return {
+      notifications,
+      unreadCount: notifications.filter((notification) => !notification.readAt).length,
+      totalCount: notifications.length,
+    }
+  }
+
+  private getUserNotifications(data: DatabaseShape, userId: string): AppNotification[] {
+    return data.notifications
+      .filter((notification) => notification.userId === userId)
+      .sort((first, second) => new Date(second.createdAt).getTime() - new Date(first.createdAt).getTime())
+  }
+
+  private getUnreadNotificationCount(data: DatabaseShape, userId: string) {
+    return data.notifications.filter((notification) => notification.userId === userId && !notification.readAt).length
+  }
+
+  private buildDashboard(data: DatabaseShape = this.database.read(), alertPage: string | number = 1, alertLimit: string | number = 10) {
+    const studentsWithVisuals = data.students.map((student) => this.withLinkedUserVisuals(student, data.users))
+    const activeStudents = studentsWithVisuals.filter((student) => student.status === 'matriculado')
     const avgAttendance = this.average(activeStudents.map((student) => student.attendanceRate))
     const avgScore = this.average(activeStudents.map((student) => student.averageScore))
     const highRisk = activeStudents.filter((student) => student.desempenho === 'Baixo')
+    const classNameById = new Map(data.classes.map((classRoom) => [classRoom.id, classRoom.name]))
+    const alerts = highRisk.map((student) => ({
+      id: `alert-${student.id}`,
+      title: `${student.name} em risco pedagogico`,
+      description: `Frequencia ${student.attendanceRate}% e media ${student.averageScore.toFixed(1)}. Recomenda-se intervencao da coordenacao.`,
+      tone: 'danger' as const,
+      studentId: student.id,
+      student: {
+        id: student.id,
+        name: student.name,
+        classId: student.classId,
+        className: classNameById.get(student.classId),
+        attendanceRate: student.attendanceRate,
+        averageScore: student.averageScore,
+        avatarUrl: student.avatarUrl,
+        bannerUrl: student.bannerUrl,
+      },
+    }))
+    const alertsPage = this.paginate(alerts, alertPage, alertLimit, 10)
 
     return {
       metrics: [
@@ -1337,8 +2244,119 @@ export class LiensinaService {
         { subject: 'Ciencias', acertos: 78 },
         { subject: 'Humanas', acertos: 69 },
       ],
-      alerts: highRisk.map((student) => ({ id: `alert-${student.id}`, title: `${student.name} em risco pedagogico`, description: `Frequencia ${student.attendanceRate}% e media ${student.averageScore.toFixed(1)}. Recomenda-se intervencao da coordenacao.`, tone: 'danger' as const })),
+      alerts: alertsPage.items,
+      alertsSummary: {
+        danger: highRisk.length,
+        warning: 0,
+        info: 0,
+      },
+      alertsPagination: alertsPage.pagination,
     }
+  }
+
+  private ensureCurrentMonthMealManagements(actorId?: string) {
+    const mesReferencia = this.getCurrentReferenceMonth()
+    if (!this.hasMissingMealManagements(this.database.read(), mesReferencia)) return
+
+    this.database.update((data) => {
+      this.createMissingMealManagements(data, mesReferencia, actorId)
+    })
+  }
+
+  private ensureMealManagementDataReady(actorId?: string) {
+    const mesReferencia = this.getCurrentReferenceMonth()
+    const currentData = this.database.read()
+    const hasApprovedRequestsWaitingForStock = currentData.mealFoodRequests.some((request) => (
+      request.status === 'APPROVED_BY_NUTRITIONIST' && !request.stockItemId
+    ))
+
+    if (!this.hasMissingMealManagements(currentData, mesReferencia) && !hasApprovedRequestsWaitingForStock) return
+
+    this.database.update((data) => {
+      this.createMissingMealManagements(data, mesReferencia, actorId)
+      this.syncApprovedMealFoodRequestsToStock(data, actorId)
+    })
+  }
+
+  private hasMissingMealManagements(data: DatabaseShape, mesReferencia: string) {
+    const existingKeys = new Set(data.mealManagements.map((management) => `${management.escolaId}:${management.mesReferencia}`))
+    return data.schools.some((school) => school.active !== false && !existingKeys.has(`${school.id}:${mesReferencia}`))
+  }
+
+  private createMissingMealManagements(data: DatabaseShape, mesReferencia: string, actorId?: string) {
+    const existingKeys = new Set(data.mealManagements.map((management) => `${management.escolaId}:${management.mesReferencia}`))
+    const created: MealManagement[] = []
+    const fallbackResponsibleId = this.getFallbackMealResponsibleId(data, actorId)
+
+    for (const school of data.schools) {
+      if (school.active === false) continue
+
+      const key = `${school.id}:${mesReferencia}`
+      if (existingKeys.has(key)) continue
+
+      const responsibleId = data.users.find((user) => user.schoolId === school.id)?.id ?? fallbackResponsibleId
+      created.push(this.buildEmptyMealManagement(school.id, mesReferencia, responsibleId))
+      existingKeys.add(key)
+    }
+
+    if (!created.length) return
+
+    data.mealManagements.unshift(...created)
+    if (actorId) this.pushAudit(data, actorId, 'Criou gestoes de merenda pendentes', `${created.length} escola(s) ${mesReferencia}`)
+  }
+
+  private buildEmptyMealManagement(escolaId: string, mesReferencia: string, responsibleId: string): MealManagement {
+    return this.recalculateMealManagement({
+      id: this.createId('meal-management'),
+      escolaId,
+      mesReferencia,
+      status: 'ATIVO',
+      orcamentoMensal: {
+        id: this.createId('meal-budget'),
+        valorLimite: defaultMealBudgetLimit,
+        valorUtilizado: 0,
+        valorDisponivel: defaultMealBudgetLimit,
+        percentualUtilizado: 0,
+        status: 'DENTRO_DO_LIMITE',
+        alertaAoAtingirPercentual: defaultMealBudgetAlertPercent,
+        permitirUltrapassarLimite: false,
+      },
+      responsaveisGestao: {
+        diretorId: responsibleId,
+        nutricionistaId: responsibleId,
+        merendeiroId: responsibleId,
+        responsavelFinanceiroId: responsibleId,
+      },
+      alimentosCadastrados: [],
+      cardapios: [],
+      itensMerenda: [],
+      movimentacoesOrcamento: [],
+      estoqueMerenda: [],
+      resumo: {
+        totalItens: 0,
+        totalKgComprado: 0,
+        valorTotalComprado: 0,
+        orcamentoInicial: defaultMealBudgetLimit,
+        orcamentoRestante: defaultMealBudgetLimit,
+        percentualUtilizado: 0,
+        statusOrcamento: 'DENTRO_DO_LIMITE',
+        itensBaixoEstoque: 0,
+        itensVencidos: 0,
+      },
+    })
+  }
+
+  private getFallbackMealResponsibleId(data: DatabaseShape, actorId?: string) {
+    if (actorId && data.users.some((user) => user.id === actorId)) return actorId
+
+    const adminRoleId = data.roles.find((role) => role.code === 'ADMIN')?.id
+    return data.users.find((user) => user.roleId === adminRoleId)?.id
+      ?? data.users[0]?.id
+      ?? 'sistema'
+  }
+
+  private getCurrentReferenceMonth() {
+    return new Date().toISOString().slice(0, 7)
   }
 
   private recalculateMealManagement(management: MealManagement): MealManagement {
@@ -1390,6 +2408,319 @@ export class LiensinaService {
     const index = data.mealManagements.findIndex((management) => management.id === managementId)
     if (index < 0) throw new NotFoundException('Gestao de merenda nao encontrada.')
     return index
+  }
+
+  private getLatestMealManagementIndexForSchool(data: { mealManagements: MealManagement[] }, schoolId: string) {
+    const index = data.mealManagements.findIndex((management) => management.escolaId === schoolId && management.status === 'ATIVO')
+    if (index >= 0) return index
+    const fallbackIndex = data.mealManagements.findIndex((management) => management.escolaId === schoolId)
+    if (fallbackIndex < 0) throw new NotFoundException('Gestao de merenda nao encontrada para esta escola.')
+    return fallbackIndex
+  }
+
+  private resolveFoodRequestSchoolId(data: DatabaseShape, actor: UserAccount, roleCode: RoleCode, value?: string | null) {
+    const requestedSchoolId = String(value ?? '').trim()
+    if (roleCode === 'DIRETOR') {
+      if (!actor.schoolId) throw new BadRequestException('Diretor nao possui escola vinculada.')
+      if (requestedSchoolId && requestedSchoolId !== actor.schoolId) {
+        throw new ForbiddenException('Diretor so pode solicitar alimentos para a propria escola.')
+      }
+      return actor.schoolId
+    }
+
+    if (!requestedSchoolId) throw new BadRequestException('Informe a escola da solicitacao.')
+    this.ensureSchoolExists(data, requestedSchoolId)
+    return requestedSchoolId
+  }
+
+  private canCreatorMutateMealFoodRequest(status: FoodRequestStatus) {
+    return status === 'PENDING_NUTRITIONIST_APPROVAL'
+      || status === 'NEEDS_ADJUSTMENT'
+      || status === 'REJECTED_BY_NUTRITIONIST'
+  }
+
+  private buildMealFoodRequest(
+    data: DatabaseShape,
+    payload: CreateMealFoodRequestPayload,
+    schoolId: string,
+    requestedBy: string,
+    createdAt: string,
+    id: string = this.createId('meal-request'),
+  ): MealFoodRequest {
+    const itemName = String(payload.itemName ?? '').trim()
+    const quantity = Number(payload.quantity)
+    const unitPrice = payload.unitPrice === undefined || payload.unitPrice === null || payload.unitPrice === 0 ? null : Number(payload.unitPrice)
+    const reason = String(payload.reason ?? '').trim()
+    const urgencyLevel = this.normalizeFoodRequestUrgency(payload.urgencyLevel)
+
+    this.ensureSchoolExists(data, schoolId)
+    if (!itemName) throw new BadRequestException('Informe o alimento solicitado.')
+    if (!Number.isFinite(quantity) || quantity <= 0) throw new BadRequestException('Quantidade deve ser maior que zero.')
+    if (unitPrice !== null && (!Number.isFinite(unitPrice) || unitPrice <= 0)) throw new BadRequestException('Valor unitario deve ser maior que zero.')
+    if (!reason) throw new BadRequestException('Informe o motivo da solicitacao.')
+
+    return {
+      id,
+      schoolId,
+      requestedBy,
+      itemName,
+      quantity,
+      unit: this.normalizeMealUnit(payload.unit),
+      unitPrice,
+      reason,
+      urgencyLevel,
+      expirationDate: this.normalizeMealDate(payload.expirationDate),
+      observation: payload.observation ? String(payload.observation).trim() : null,
+      status: 'PENDING_NUTRITIONIST_APPROVAL',
+      reviewedBy: null,
+      reviewedAt: null,
+      nutritionistObservation: null,
+      rejectionReason: null,
+      suggestedQuantity: null,
+      suggestedUnit: null,
+      suggestedUnitPrice: null,
+      confirmedBy: null,
+      confirmedAt: null,
+      supplierName: null,
+      purchaseValue: null,
+      purchaseDate: null,
+      stockItemId: null,
+      createdAt,
+      updatedAt: createdAt,
+    }
+  }
+
+  private syncApprovedMealFoodRequestsToStock(data: DatabaseShape, actorId?: string) {
+    const approvedRequests = data.mealFoodRequests.filter((request) => (
+      request.status === 'APPROVED_BY_NUTRITIONIST' && !request.stockItemId
+    ))
+
+    for (const request of approvedRequests) {
+      const requestIndex = data.mealFoodRequests.findIndex((item) => item.id === request.id)
+      if (requestIndex < 0) continue
+
+      const responsibleId = request.reviewedBy ?? actorId ?? request.requestedBy
+      const historyActor = data.users.find((user) => user.id === responsibleId)
+        ?? data.users.find((user) => user.id === actorId)
+        ?? data.users.find((user) => user.id === request.requestedBy)
+
+      const result = this.addFoodRequestToMealStock(data, request, responsibleId, {}, { createMenu: true, automaticApproval: true })
+      data.mealFoodRequests[requestIndex] = result.request
+
+      if (historyActor) {
+        this.pushMealRequestHistory(
+          data,
+          historyActor,
+          'ADDED_FOOD_REQUEST_TO_STOCK',
+          result.request,
+          request,
+          result.request,
+          `Solicitacao aprovada anteriormente entrou automaticamente no estoque e no cardapio: ${result.food.nome}`,
+        )
+      }
+      this.pushAudit(data, responsibleId, 'Sincronizou solicitacao aprovada com estoque/cardapio', result.food.nome)
+    }
+  }
+
+  private addFoodRequestToMealStock(
+    data: DatabaseShape,
+    request: MealFoodRequest,
+    actorId: string,
+    payload: AddMealFoodRequestToStockPayload = {},
+    options: { createMenu?: boolean; automaticApproval?: boolean } = {},
+  ) {
+    this.createMissingMealManagements(data, this.getCurrentReferenceMonth(), actorId)
+
+    const managementIndex = this.getLatestMealManagementIndexForSchool(data, request.schoolId)
+    const management = data.mealManagements[managementIndex]
+    const food = this.findOrCreateMealFoodFromRequest(data, management, request)
+    const quantity = Number(request.suggestedQuantity && request.suggestedQuantity > 0 ? request.suggestedQuantity : request.quantity)
+    const unitPrice = Math.max(0, Number(payload.valorUnitario ?? request.suggestedUnitPrice ?? request.unitPrice ?? 0))
+    const valorTotal = Number((quantity * unitPrice).toFixed(2))
+    const dataValidade = this.normalizeMealDate(payload.dataValidade ?? request.expirationDate)
+    const quantidadeMinima = Math.max(0, Number(payload.quantidadeMinima ?? Math.max(1, Math.round(quantity * 0.2))))
+    const fornecedorNome = String(payload.fornecedorNome ?? '').trim()
+      || (options.automaticApproval ? 'Aprovacao nutricional automatica' : 'Fornecedor nao informado')
+    const saldoAntes = management.orcamentoMensal.valorDisponivel
+    const saldoDepois = Number((saldoAntes - valorTotal).toFixed(2))
+
+    if (!Number.isFinite(quantity) || quantity <= 0) throw new BadRequestException('Quantidade aprovada deve ser maior que zero.')
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new BadRequestException('Valor unitario deve ser maior ou igual a zero.')
+    if (!Number.isFinite(quantidadeMinima) || quantidadeMinima < 0) throw new BadRequestException('Quantidade minima nao pode ser negativa.')
+    if (!management.orcamentoMensal.permitirUltrapassarLimite && saldoDepois < 0) {
+      throw new BadRequestException('Entrada ultrapassa o limite mensal da merenda.')
+    }
+
+    const itemId = this.createId('meal-item')
+    const stockStatus = this.resolveMealStockStatus(quantity, quantidadeMinima, dataValidade)
+    const now = new Date().toISOString()
+    const item = {
+      id: itemId,
+      alimentoId: food.id,
+      nomeAlimento: food.nome,
+      categoria: food.categoria,
+      quantidade: quantity,
+      unidadeMedida: food.unidadeMedida,
+      valorUnitario: unitPrice,
+      valorTotal,
+      dataValidade,
+      possuiValidade: Boolean(dataValidade),
+      lote: null,
+      fornecedor: {
+        id: this.createId('supplier'),
+        nome: fornecedorNome,
+      },
+      statusEstoque: stockStatus,
+      adicionadoPorId: actorId,
+      adicionadoEm: now,
+    }
+
+    management.itensMerenda.unshift(item)
+    management.estoqueMerenda.unshift({
+      id: this.createId('meal-stock'),
+      itemMerendaId: itemId,
+      alimentoId: food.id,
+      nomeAlimento: food.nome,
+      quantidadeAtual: quantity,
+      quantidadeMinima,
+      unidadeMedida: food.unidadeMedida,
+      dataValidade,
+      status: stockStatus,
+    })
+    management.movimentacoesOrcamento.unshift({
+      id: this.createId('meal-budget-movement'),
+      tipo: valorTotal > 0 ? 'COMPRA' : 'AJUSTE',
+      itemMerendaId: itemId,
+      descricao: `Entrada no estoque: ${food.nome}${payload.observacao ? ` - ${String(payload.observacao).trim()}` : ''}`,
+      valor: valorTotal,
+      saldoAntes,
+      saldoDepois,
+      responsavelId: actorId,
+      dataMovimentacao: now,
+    })
+
+    if (options.createMenu) {
+      this.upsertAutomaticMealMenu(management, food, request)
+    }
+
+    const updatedRequest: MealFoodRequest = {
+      ...request,
+      status: 'ADDED_TO_STOCK',
+      confirmedBy: actorId,
+      confirmedAt: now,
+      supplierName: fornecedorNome,
+      purchaseValue: valorTotal,
+      purchaseDate: this.normalizeMealDate(payload.dataCompra) ?? now.slice(0, 10),
+      stockItemId: itemId,
+      updatedAt: now,
+    }
+
+    const updatedManagement = this.recalculateMealManagement(management)
+    data.mealManagements[managementIndex] = updatedManagement
+
+    return {
+      request: updatedRequest,
+      management: updatedManagement,
+      food,
+      quantity,
+    }
+  }
+
+  private upsertAutomaticMealMenu(management: MealManagement, food: MealFood, request: MealFoodRequest) {
+    const tipoRefeicao = this.resolveAutomaticMealType(food, request)
+    const turno = this.resolveAutomaticMealShift(tipoRefeicao)
+    const diaSemana = this.resolveAutomaticMealWeekday(management, tipoRefeicao)
+    const dayKey = this.normalizeTextKey(diaSemana)
+    const existingMenu = management.cardapios.find((menu) => (
+      menu.status !== 'CANCELADO'
+      && menu.tipoRefeicao === tipoRefeicao
+      && this.normalizeTextKey(menu.diaSemana) === dayKey
+    ))
+
+    if (existingMenu) {
+      if (!existingMenu.alimentoIds.includes(food.id)) existingMenu.alimentoIds.push(food.id)
+      existingMenu.status = 'APROVADO'
+      existingMenu.observacao = this.appendAutomaticMenuObservation(existingMenu.observacao, request)
+      return
+    }
+
+    management.cardapios.push({
+      id: this.createId('meal-menu'),
+      diaSemana,
+      tipoRefeicao,
+      turno,
+      titulo: `Cardapio automatico: ${food.nome}`,
+      alimentoIds: [food.id],
+      observacao: `Gerado automaticamente a partir da solicitacao aprovada ${request.id}.`,
+      status: 'APROVADO',
+    })
+  }
+
+  private appendAutomaticMenuObservation(current: string | undefined, request: MealFoodRequest) {
+    const addition = `Atualizado automaticamente pela solicitacao aprovada ${request.id}.`
+    if (!current) return addition
+    if (current.includes(request.id)) return current
+    return `${current} ${addition}`
+  }
+
+  private resolveAutomaticMealType(food: MealFood, request: MealFoodRequest): MealType {
+    const text = this.normalizeTextKey(`${food.nome} ${food.categoria} ${request.reason} ${request.observation ?? ''}`)
+    if (/(leite|cafe|iogurte|cereal|aveia|pao|tapioca|biscoito)/.test(text)) return 'CAFE_DA_MANHA'
+    if (/(fruta|banana|maca|melao|melancia|laranja|suco|vitamina|lanche|bolo)/.test(text)) return 'LANCHE'
+    if (/(jantar|sopa|caldo|canja)/.test(text)) return 'JANTAR'
+    return 'ALMOCO'
+  }
+
+  private resolveAutomaticMealShift(tipoRefeicao: MealType): MealShift {
+    if (tipoRefeicao === 'CAFE_DA_MANHA' || tipoRefeicao === 'LANCHE') return 'MANHA'
+    if (tipoRefeicao === 'JANTAR') return 'NOITE'
+    return 'INTEGRAL'
+  }
+
+  private resolveAutomaticMealWeekday(management: MealManagement, tipoRefeicao: MealType) {
+    const weekdays = ['Segunda-feira', 'Terca-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira']
+    const weekdayNumberByName = new Map(weekdays.map((day, index) => [day, index + 1]))
+    const today = new Date().getDay()
+    const startDay = today >= 1 && today <= 5 ? today : 1
+
+    return weekdays
+      .map((diaSemana) => {
+        const dayKey = this.normalizeTextKey(diaSemana)
+        const dayNumber = weekdayNumberByName.get(diaSemana) ?? 1
+        const dayMenus = management.cardapios.filter((menu) => menu.status !== 'CANCELADO' && this.normalizeTextKey(menu.diaSemana) === dayKey)
+        const sameTypeCount = dayMenus.filter((menu) => menu.tipoRefeicao === tipoRefeicao).length
+        return {
+          diaSemana,
+          menuCount: dayMenus.length,
+          sameTypeCount,
+          distance: (dayNumber - startDay + 5) % 5,
+        }
+      })
+      .sort((first, second) => first.sameTypeCount - second.sameTypeCount || first.menuCount - second.menuCount || first.distance - second.distance)[0]
+      .diaSemana
+  }
+
+  private findOrCreateMealFoodFromRequest(data: DatabaseShape, management: MealManagement, request: MealFoodRequest): MealFood {
+    const key = this.normalizeMealFoodSearch(request.itemName)
+    let food = data.mealFoods.find((item) => this.normalizeMealFoodSearch(item.nome) === key)
+
+    if (!food) {
+      const nextFoodId = Math.max(0, ...data.mealFoods.map((item) => item.id)) + 1
+      food = this.buildMealFood({
+        nome: request.itemName,
+        categoria: 'SOLICITADO',
+        unidadeMedida: request.suggestedUnit ?? request.unit,
+        iconKey: 'utensils',
+        ativo: true,
+      }, nextFoodId)
+      data.mealFoods.push(food)
+    }
+
+    if (!management.alimentosCadastrados.some((item) => item.id === food.id)) {
+      management.alimentosCadastrados.push(food)
+    }
+
+    return food
   }
 
   private normalizeResponsibleId(data: { users: UserAccount[] }, value: unknown, schoolId: string, fallbackId: string) {
@@ -1491,10 +2822,17 @@ export class LiensinaService {
     return month
   }
 
-  private normalizeMealUnit(value: unknown): 'KG' | 'UN' | 'L' {
+  private normalizeMealUnit(value: unknown): MealUnit {
     const unit = String(value ?? '').trim().toUpperCase()
-    if (unit === 'UN' || unit === 'L' || unit === 'KG') return unit
+    if (unit === 'UN') return 'UNIT'
+    if (unit === 'KG' || unit === 'G' || unit === 'L' || unit === 'ML' || unit === 'UNIT' || unit === 'BOX' || unit === 'PACKAGE' || unit === 'DOZEN') return unit
     throw new BadRequestException('Unidade de medida da merenda invalida.')
+  }
+
+  private normalizeFoodRequestUrgency(value: unknown) {
+    const urgency = String(value ?? '').trim().toUpperCase()
+    if (urgency === 'LOW' || urgency === 'MEDIUM' || urgency === 'HIGH' || urgency === 'URGENT') return urgency
+    throw new BadRequestException('Urgencia da solicitacao invalida.')
   }
 
   private normalizeMealType(value: unknown): MealType {
@@ -1617,6 +2955,195 @@ export class LiensinaService {
     return (Number.isFinite(seconds) && seconds >= 0 ? seconds : defaultRefreshReuseGraceSeconds) * 1000
   }
 
+  private paginate<T>(items: T[], rawPage: string | number = 1, rawLimit: string | number = 10, defaultLimit = 10) {
+    const page = Math.max(1, Number(rawPage) || 1)
+    const limit = Math.min(100, Math.max(1, Number(rawLimit) || defaultLimit))
+    const total = items.length
+    const totalPages = Math.max(1, Math.ceil(total / limit))
+    const safePage = Math.min(page, totalPages)
+    const start = (safePage - 1) * limit
+
+    return {
+      items: items.slice(start, start + limit),
+      pagination: {
+        page: safePage,
+        limit,
+        total,
+        totalPages,
+      },
+    }
+  }
+
+  private getScopedSchoolsData(data: DatabaseShape, currentUser: UserAccount) {
+    const studentsWithVisuals = data.students.map((student) => this.withLinkedUserVisuals(student, data.users))
+    const teachersWithVisuals = data.teachers.map((teacher) => this.withLinkedUserVisuals(teacher, data.users))
+    const guardiansWithVisuals = data.guardians.map((guardian) => this.withLinkedUserVisuals(guardian, data.users))
+    const role = data.roles.find((item) => item.id === currentUser.roleId)
+    const roleCode = role?.code ?? role?.name
+
+    if (roleCode === 'ADMIN') {
+      return {
+        schools: data.schools,
+        classes: data.classes,
+        teachers: teachersWithVisuals,
+        students: studentsWithVisuals,
+        guardians: guardiansWithVisuals,
+      }
+    }
+
+    const linkedTeachers = teachersWithVisuals.filter((teacher) => teacher.id === currentUser.linkedTeacherId || teacher.userId === currentUser.id)
+    const teacherIds = new Set(linkedTeachers.map((teacher) => teacher.id))
+    const studentIds = new Set(studentsWithVisuals
+      .filter((student) => student.id === currentUser.linkedStudentId || student.userId === currentUser.id)
+      .map((student) => student.id))
+    const guardianIds = new Set(guardiansWithVisuals
+      .filter((guardian) => guardian.id === currentUser.linkedGuardianId || guardian.userId === currentUser.id)
+      .map((guardian) => guardian.id))
+
+    if (roleCode === 'DIRETOR' || roleCode === 'COORDENADOR') {
+      const schoolIds = new Set(data.schools.filter((school) => currentUser.schoolId === school.id).map((school) => school.id))
+      const classes = data.classes.filter((classRoom) => schoolIds.has(classRoom.schoolId))
+      const classIds = new Set(classes.map((classRoom) => classRoom.id))
+
+      return {
+        schools: data.schools.filter((school) => schoolIds.has(school.id)),
+        classes,
+        teachers: teachersWithVisuals.filter((teacher) => schoolIds.has(teacher.schoolId)),
+        students: studentsWithVisuals.filter((student) => schoolIds.has(student.schoolId) || classIds.has(student.classId)),
+        guardians: guardiansWithVisuals.filter((guardian) => schoolIds.has(guardian.schoolId)),
+      }
+    }
+
+    if (roleCode === 'PROFESSOR') {
+      const classes = data.classes.filter((classRoom) => (
+        teacherIds.has(classRoom.teacherId)
+        || (classRoom.teacherIds ?? []).some((teacherId) => teacherIds.has(teacherId))
+        || linkedTeachers.some((teacher) => this.teacherMatchesClassByDiscipline(teacher, classRoom))
+      ))
+      const classIds = new Set(classes.map((classRoom) => classRoom.id))
+      const schoolIds = new Set([
+        ...linkedTeachers.map((teacher) => teacher.schoolId),
+        ...classes.map((classRoom) => classRoom.schoolId),
+      ].filter(Boolean))
+      const students = studentsWithVisuals.filter((student) => classIds.has(student.classId))
+      const guardianIdsFromStudents = new Set(students.flatMap((student) => student.guardianIds ?? []))
+
+      return {
+        schools: data.schools.filter((school) => schoolIds.has(school.id)),
+        classes,
+        teachers: teachersWithVisuals.filter((teacher) => teacherIds.has(teacher.id)),
+        students,
+        guardians: guardiansWithVisuals.filter((guardian) => guardianIdsFromStudents.has(guardian.id)),
+      }
+    }
+
+    if (roleCode === 'ALUNO') {
+      const students = studentsWithVisuals.filter((student) => studentIds.has(student.id))
+      const classIds = new Set(students.map((student) => student.classId))
+      const schoolIds = new Set(students.map((student) => student.schoolId))
+      const classes = data.classes.filter((classRoom) => classIds.has(classRoom.id))
+      const teacherIdsFromClasses = new Set(classes.flatMap((classRoom) => [classRoom.teacherId, ...(classRoom.teacherIds ?? [])].filter(Boolean)))
+
+      return {
+        schools: data.schools.filter((school) => schoolIds.has(school.id)),
+        classes,
+        teachers: teachersWithVisuals.filter((teacher) => teacherIdsFromClasses.has(teacher.id)),
+        students,
+        guardians: [],
+      }
+    }
+
+    if (roleCode === 'RESPONSAVEL') {
+      const guardians = guardiansWithVisuals.filter((guardian) => guardianIds.has(guardian.id))
+      const linkedStudentIds = new Set(guardians.flatMap((guardian) => guardian.studentIds ?? []))
+      const students = studentsWithVisuals.filter((student) => linkedStudentIds.has(student.id) || (student.guardianIds ?? []).some((guardianId) => guardianIds.has(guardianId)))
+      const classIds = new Set(students.map((student) => student.classId))
+      const schoolIds = new Set(students.map((student) => student.schoolId))
+      const classes = data.classes.filter((classRoom) => classIds.has(classRoom.id))
+      const teacherIdsFromClasses = new Set(classes.flatMap((classRoom) => [classRoom.teacherId, ...(classRoom.teacherIds ?? [])].filter(Boolean)))
+
+      return {
+        schools: data.schools.filter((school) => schoolIds.has(school.id)),
+        classes,
+        teachers: teachersWithVisuals.filter((teacher) => teacherIdsFromClasses.has(teacher.id)),
+        students,
+        guardians,
+      }
+    }
+
+    return {
+      schools: data.schools,
+      classes: data.classes,
+      teachers: teachersWithVisuals,
+      students: studentsWithVisuals,
+      guardians: guardiansWithVisuals,
+    }
+  }
+
+  private withLinkedUserVisuals<T extends { id: string; userId: string; avatarUrl?: string; bannerUrl?: string; avatarObject?: unknown; bannerObject?: unknown }>(
+    entity: T,
+    users: UserAccount[],
+  ): T {
+    const linkedUsers = users.filter((user) =>
+      user.id === entity.userId ||
+      user.linkedStudentId === entity.id ||
+      user.linkedTeacherId === entity.id ||
+      user.linkedGuardianId === entity.id,
+    )
+    const primaryUser = linkedUsers.find((user) => user.id === entity.userId)
+    const userWithAvatar = linkedUsers.find((user) => user.avatarUrl || user.avatarObject)
+    const userWithBanner = linkedUsers.find((user) => user.bannerUrl || user.bannerObject)
+    const avatarSource = primaryUser?.avatarUrl || primaryUser?.avatarObject ? primaryUser : userWithAvatar
+    const bannerSource = primaryUser?.bannerUrl || primaryUser?.bannerObject ? primaryUser : userWithBanner
+
+    return {
+      ...entity,
+      avatarUrl: entity.avatarUrl || avatarSource?.avatarUrl || avatarSource?.avatarObject?.publicUrl,
+      bannerUrl: entity.bannerUrl || bannerSource?.bannerUrl || bannerSource?.bannerObject?.publicUrl,
+      avatarObject: entity.avatarObject ?? avatarSource?.avatarObject,
+      bannerObject: entity.bannerObject ?? bannerSource?.bannerObject,
+    }
+  }
+
+  private splitAcademicTokens(value?: string | null) {
+    return String(value ?? '')
+      .split(/[,;|/]+|\s+-\s+/)
+      .map((item) => this.normalizeTextKey(item))
+      .filter(Boolean)
+  }
+
+  private teacherMatchesClassByDiscipline(teacher: Teacher, classRoom: ClassRoom) {
+    const teacherTokens = this.splitAcademicTokens(teacher.specialty)
+    const classTokens = (classRoom.bnccFocus ?? []).flatMap((focus) => this.splitAcademicTokens(focus))
+    if (!teacherTokens.length || !classTokens.length) return false
+
+    return teacherTokens.some((teacherToken) => classTokens.some((classToken) => (
+      teacherToken === classToken
+      || teacherToken.includes(classToken)
+      || classToken.includes(teacherToken)
+    )))
+  }
+
+  private normalizeClassGrade(value?: string | null) {
+    const current = String(value ?? '').trim()
+    const direct = current.toUpperCase()
+    if (/^EF[1-9]$/.test(direct) || /^EM[1-3]$/.test(direct)) return direct
+
+    const normalized = current
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[º°]/g, '')
+      .replace(/[^a-zA-Z0-9]+/g, ' ')
+      .trim()
+      .toUpperCase()
+    const year = Number(normalized.match(/\b([1-9])\b/)?.[1] ?? 0)
+
+    if (year >= 1 && year <= 3 && normalized.includes('MEDIO')) return `EM${year}`
+    if (year >= 1 && year <= 9 && (normalized.includes('FUNDAMENTAL') || normalized.includes('ANO'))) return `EF${year}`
+
+    return current
+  }
+
   private ensureCurrentUser(data: { users: UserAccount[] }, userId: string) {
     const currentUser = data.users.find((user) => user.id === userId)
     if (!currentUser) throw new UnauthorizedException('Usuario nao encontrado.')
@@ -1632,14 +3159,30 @@ export class LiensinaService {
     return currentUser
   }
 
+  private getCurrentRoleCode(data: { roles: Role[] }, currentUser: UserAccount): RoleCode {
+    const role = data.roles.find((item) => item.id === currentUser.roleId)
+    return role?.code ?? role?.name ?? 'ADMIN'
+  }
+
+  private ensureCalendarEventMutationAllowed(data: { users: UserAccount[]; roles: Role[] }, actorId: string, event: SchoolCalendarEvent) {
+    const currentUser = this.ensureCurrentUser(data, actorId)
+    const role = data.roles.find((item) => item.id === currentUser.roleId)
+    const roleCode = role?.code ?? role?.name
+    if (roleCode === 'ADMIN') return
+    if (event.createdById && event.createdById === currentUser.id) return
+    throw new ForbiddenException('Apenas o criador do evento ou um Admin pode alterar este evento.')
+  }
+
   private buildCalendarEvent(data: { schools: School[]; classes: ClassRoom[] }, payload: Partial<SchoolCalendarEvent>, id: string = this.createId('cal')): SchoolCalendarEvent {
     const allDay = payload.allDay ?? false
     const type = this.normalizeCalendarType(payload.type)
     const schoolId = String(payload.schoolId ?? '').trim()
     const classId = payload.classId ? String(payload.classId).trim() : null
+    const createdById = String(payload.createdById ?? '').trim()
     const startsAt = this.normalizeCalendarDateValue(payload.startsAt, allDay)
     const endsAt = this.normalizeCalendarDateValue(payload.endsAt, allDay)
 
+    if (!createdById) throw new BadRequestException('Autor do evento nao informado.')
     if (!data.schools.some((school) => school.id === schoolId)) throw new BadRequestException('Escola informada nao existe.')
     if (classId && !data.classes.some((classRoom) => classRoom.id === classId && classRoom.schoolId === schoolId)) {
       throw new BadRequestException('Turma informada nao pertence a escola selecionada.')
@@ -1652,6 +3195,7 @@ export class LiensinaService {
       type,
       schoolId,
       classId,
+      createdById,
       startsAt,
       endsAt,
       allDay,
@@ -1673,6 +3217,531 @@ export class LiensinaService {
       throw new BadRequestException(allDay ? 'Datas de eventos de dia inteiro devem usar AAAA-MM-DD.' : 'Datas de eventos com horario devem usar AAAA-MM-DDTHH:mm.')
     }
     return normalized
+  }
+
+  private buildRoomReservation(data: { classes: ClassRoom[]; roomReservations: RoomReservation[] }, payload: Partial<RoomReservation>, id: string = this.createId('room-reservation')): RoomReservation {
+    const room = String(payload.room ?? '').trim()
+    const classId = String(payload.classId ?? '').trim()
+    const date = this.normalizeReservationDate(payload.date)
+    const startTime = this.normalizeReservationTime(payload.startTime)
+    const endTime = this.normalizeReservationTime(payload.endTime)
+    const purpose = String(payload.purpose ?? '').trim()
+
+    if (room.length < 2) throw new BadRequestException('Informe o ambiente da reserva.')
+    if (room.length > 120) throw new BadRequestException('Ambiente deve conter no maximo 120 caracteres.')
+    if (purpose.length < 3) throw new BadRequestException('Informe a finalidade da reserva.')
+    if (purpose.length > 500) throw new BadRequestException('Finalidade deve conter no maximo 500 caracteres.')
+    if (!data.classes.some((classRoom) => classRoom.id === classId)) throw new BadRequestException('Turma informada nao existe.')
+    if (this.parseReservationTime(endTime) <= this.parseReservationTime(startTime)) {
+      throw new BadRequestException('Horario final precisa ser posterior ao inicio da reserva.')
+    }
+
+    const reservation = { id, room, date, startTime, endTime, classId, purpose }
+    if (this.hasRoomReservationConflict(data.classes, data.roomReservations, reservation)) {
+      throw new BadRequestException('Ja existe uma reserva para esta sala neste horario.')
+    }
+
+    return reservation
+  }
+
+  private buildLessonRecord(data: { classes: ClassRoom[] }, payload: Partial<LessonRecord>, id: string = this.createId('lesson')): LessonRecord {
+    const classId = String(payload.classId ?? '').trim()
+    const subject = this.normalizeBoundedText(payload.subject, 'Materia', 2, 120)
+    const date = this.normalizeLessonDate(payload.date)
+    const time = this.normalizeLessonTime(payload.time)
+    const content = this.normalizeBoundedText(payload.content, 'Conteudo ministrado', 3, 2000)
+    const plan = this.normalizeBoundedText(payload.plan, 'Plano de aula', 3, 2000)
+    const resources = this.normalizeBoundedText(payload.resources, 'Recursos utilizados', 2, 1000)
+    const activity = this.normalizeBoundedText(payload.activity, 'Atividade realizada', 3, 2000)
+    const notes = this.normalizeOptionalBoundedText(payload.notes, 'Observacoes', 1000)
+
+    if (!data.classes.some((classRoom) => classRoom.id === classId)) throw new BadRequestException('Turma informada nao existe.')
+
+    return { id, classId, subject, date, time, content, plan, resources, activity, notes }
+  }
+
+  private hasRoomReservationConflict(classes: ClassRoom[], reservations: RoomReservation[], reservation: RoomReservation) {
+    const roomKey = this.normalizeTextKey(reservation.room)
+    const start = this.parseReservationTime(reservation.startTime)
+    const end = this.parseReservationTime(reservation.endTime)
+    const schoolByClassId = new Map(classes.map((classRoom) => [classRoom.id, classRoom.schoolId]))
+    const reservationSchoolId = schoolByClassId.get(reservation.classId)
+
+    return reservations.some((current) => (
+      current.id !== reservation.id &&
+      schoolByClassId.get(current.classId) === reservationSchoolId &&
+      current.date === reservation.date &&
+      this.normalizeTextKey(current.room) === roomKey &&
+      this.parseReservationTime(current.startTime) < end &&
+      start < this.parseReservationTime(current.endTime)
+    ))
+  }
+
+  private normalizeReservationDate(value: unknown) {
+    const date = String(value ?? '').trim()
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new BadRequestException('Data da reserva deve usar AAAA-MM-DD.')
+
+    const parsed = new Date(`${date}T00:00:00.000Z`)
+    if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
+      throw new BadRequestException('Data da reserva invalida.')
+    }
+
+    return date
+  }
+
+  private normalizeLessonDate(value: unknown) {
+    const date = String(value ?? '').trim()
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new BadRequestException('Data da aula deve usar AAAA-MM-DD.')
+
+    const parsed = new Date(`${date}T00:00:00.000Z`)
+    if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
+      throw new BadRequestException('Data da aula invalida.')
+    }
+
+    return date
+  }
+
+  private normalizeReservationTime(value: unknown) {
+    const time = String(value ?? '').trim()
+    if (!/^\d{2}:\d{2}$/.test(time)) throw new BadRequestException('Horario da reserva deve usar HH:mm.')
+
+    const [hour, minute] = time.split(':').map(Number)
+    if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+      throw new BadRequestException('Horario da reserva invalido.')
+    }
+
+    return time
+  }
+
+  private normalizeLessonTime(value: unknown) {
+    const time = String(value ?? '').trim()
+    if (!/^\d{2}:\d{2}$/.test(time)) throw new BadRequestException('Horario da aula deve usar HH:mm.')
+
+    const [hour, minute] = time.split(':').map(Number)
+    if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+      throw new BadRequestException('Horario da aula invalido.')
+    }
+
+    return time
+  }
+
+  private normalizeBoundedText(value: unknown, label: string, minLength: number, maxLength: number) {
+    const text = String(value ?? '').trim()
+    if (text.length < minLength) throw new BadRequestException(`${label} deve ter pelo menos ${minLength} caracteres.`)
+    if (text.length > maxLength) throw new BadRequestException(`${label} deve conter no maximo ${maxLength} caracteres.`)
+    return text
+  }
+
+  private normalizeOptionalBoundedText(value: unknown, label: string, maxLength: number) {
+    const text = String(value ?? '').trim()
+    if (text.length > maxLength) throw new BadRequestException(`${label} deve conter no maximo ${maxLength} caracteres.`)
+    return text
+  }
+
+  private parseReservationTime(value: string) {
+    const [hour, minute] = value.split(':').map(Number)
+    return hour * 60 + minute
+  }
+
+  private normalizeSelectionFilter(value: unknown) {
+    const normalized = this.normalizeTextKey(value)
+    return !normalized || normalized === 'all' ? null : normalized
+  }
+
+  private canAccessEvaluation(data: DatabaseShape, actor: UserAccount, evaluation: Evaluation) {
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (roleCode === 'ADMIN') return true
+    if (!['DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) return false
+
+    const scoped = this.getScopedSchoolsData(data, actor)
+    return scoped.classes.some((classRoom) => classRoom.id === evaluation.classId)
+  }
+
+  private resolveEvaluationQuestions(data: DatabaseShape, evaluation: Evaluation) {
+    const snapshots = evaluation.questionSnapshots ?? []
+    const snapshotById = new Map(snapshots.map((question) => [question.id, question]))
+    const questions = (evaluation.questionIds ?? [])
+      .map((questionId) => data.questions.find((question) => question.id === questionId) ?? snapshotById.get(questionId))
+      .filter((question): question is Question => Boolean(question))
+
+    return questions.length ? questions : snapshots
+  }
+
+  private buildEvaluationAnswerKey(questions: Question[]): EvaluationAnswerKeyItem[] {
+    return questions.map((question, index) => {
+      const correctOption = [...(question.options ?? [])]
+        .sort((first, second) => first.order - second.order)
+        .find((option) => option.isCorrect)
+
+      if (!correctOption) {
+        throw new BadRequestException(`Questao ${index + 1} nao possui gabarito cadastrado.`)
+      }
+
+      return {
+        questionNumber: index + 1,
+        questionId: question.id,
+        correctOption: String(correctOption.label ?? '').trim().toUpperCase(),
+      }
+    })
+  }
+
+  private getEvaluationVersionId(evaluation: Evaluation) {
+    const questionSignature = (evaluation.questionIds ?? []).join(',')
+    const hash = createHash('sha1').update(`${evaluation.id}:${questionSignature}:${evaluation.questions}`).digest('hex').slice(0, 12)
+    return `${evaluation.id}:v-${hash}`
+  }
+
+  private async requestOmrCorrection(file: OmrImageFile, payload: { answerKey: EvaluationAnswerKeyItem[]; [key: string]: unknown }) {
+    const baseUrl = String(this.configService.get<string>('OMR_SERVICE_URL') ?? 'http://localhost:8000').replace(/\/+$/, '')
+    const formData = new FormData()
+    formData.append('payload', JSON.stringify(payload))
+    formData.append('image', new Blob([new Uint8Array(file.buffer)], { type: file.mimetype || 'application/octet-stream' }), file.originalname || 'cartao-resposta.jpg')
+
+    let response: Response
+    try {
+      response = await fetch(`${baseUrl}/v1/omr/process`, { method: 'POST', body: formData })
+    } catch (error) {
+      throw new BadRequestException(`Servico OMR indisponivel: ${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    const responseText = await response.text()
+    let body: unknown = {}
+    try {
+      body = responseText ? JSON.parse(responseText) : {}
+    } catch {
+      body = { message: responseText }
+    }
+
+    if (!response.ok) {
+      const message = typeof body === 'object' && body && 'detail' in body
+        ? JSON.stringify((body as { detail: unknown }).detail)
+        : responseText
+      throw new BadRequestException(`Servico OMR recusou a imagem: ${message}`)
+    }
+
+    return body as OmrServiceResponse
+  }
+
+  private normalizeCorrectionAnswers(value: unknown, answerKey: EvaluationAnswerKeyItem[]): EvaluationCorrectionDetectedAnswer[] {
+    const rows = Array.isArray(value) ? value : []
+    return answerKey.map((key) => {
+      const row = rows.find((item) => Number((item as { questionNumber?: unknown }).questionNumber) === key.questionNumber) as Partial<EvaluationCorrectionDetectedAnswer> | undefined
+      const status = row?.status === 'ok' || row?.status === 'blank' || row?.status === 'multiple' || row?.status === 'low_confidence' || row?.status === 'unreadable'
+        ? row.status
+        : 'unreadable'
+      const detectedOption = row?.detectedOption == null ? null : String(row.detectedOption).toUpperCase()
+      const correctOption = String(row?.correctOption ?? key.correctOption).toUpperCase()
+
+      return {
+        questionNumber: key.questionNumber,
+        questionId: row?.questionId ?? key.questionId,
+        detectedOption,
+        correctOption,
+        isCorrect: Boolean(row?.isCorrect),
+        status,
+        confidence: this.toConfidence(row?.confidence ?? 0),
+        markedOptions: Array.isArray(row?.markedOptions) ? row.markedOptions.map(String) : [],
+        optionScores: Array.isArray(row?.optionScores)
+          ? row.optionScores.map((score) => ({ option: String(score.option), fillRatio: Number(score.fillRatio) || 0 }))
+          : [],
+      }
+    })
+  }
+
+  private saveEvaluationCorrectionImage(evaluationId: string, studentId: string, file: OmrImageFile): StoredImageObject {
+    const extensionFromMime = file.mimetype.split('/')[1]?.replace('jpeg', 'jpg')
+    const extensionFromName = extname(file.originalname).replace(/^\./, '').toLowerCase()
+    const extension = (extensionFromMime || extensionFromName || 'jpg').replace(/[^a-z0-9]/g, '') || 'jpg'
+    const bucket = this.getOmrMediaBucket()
+    const key = `evaluations/${evaluationId}/students/${studentId}/${randomUUID()}.${extension}`
+    const uploadsDir = join(process.cwd(), 'uploads', bucket)
+    const filePath = join(uploadsDir, key)
+
+    mkdirSync(dirname(filePath), { recursive: true })
+    writeFileSync(filePath, file.buffer)
+
+    return {
+      storageProvider: 'local',
+      bucket,
+      key,
+      publicUrl: `/uploads/${bucket}/${key}`,
+      contentType: file.mimetype,
+      sizeBytes: file.size,
+      originalName: file.originalname,
+      uploadedAt: new Date().toISOString(),
+    }
+  }
+
+  private getOmrMediaBucket() {
+    return String(this.configService.get<string>('OMR_MEDIA_BUCKET') ?? 'liensina-omr-corrections')
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]/g, '-')
+      .replace(/^-+|-+$/g, '')
+      || 'liensina-omr-corrections'
+  }
+
+  private recalculateEvaluationCorrectionSummary(data: DatabaseShape, evaluationId: string) {
+    const evaluation = data.evaluations.find((item) => item.id === evaluationId)
+    if (!evaluation) return
+    const confirmed = data.evaluationCorrections.filter((correction) => correction.evaluationId === evaluationId && correction.status === 'CONFIRMED' && correction.finalScore != null)
+    evaluation.corrected = confirmed.length
+    evaluation.participants = Math.max(evaluation.participants ?? 0, confirmed.length)
+    evaluation.averageScore = confirmed.length
+      ? Number((confirmed.reduce((total, correction) => total + Number(correction.finalScore ?? 0), 0) / confirmed.length).toFixed(2))
+      : 0
+    if (confirmed.length > 0 && evaluation.status === 'planejado') evaluation.status = 'corrigindo'
+  }
+
+  private toScore(value: unknown) {
+    return Math.max(0, Math.min(10, Number(Number(value ?? 0).toFixed(2)) || 0))
+  }
+
+  private toConfidence(value: unknown) {
+    return Math.max(0, Math.min(1, Number(Number(value ?? 0).toFixed(4)) || 0))
+  }
+
+  private selectLegacyEvaluationQuestions(data: DatabaseShape, evaluation: Evaluation, actor: UserAccount) {
+    const target = this.normalizeQuestionQuantity(evaluation.questions)
+    if (target <= 0) return []
+
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    const subjectFilter = this.normalizeTextKey(evaluation.subject)
+    const classRoom = data.classes.find((item) => item.id === evaluation.classId)
+    const gradeFilter = this.normalizeTextKey(classRoom?.grade)
+    const schoolId = classRoom?.schoolId
+
+    const subjectPool = data.questions.filter((question) => {
+      if (question.status !== 'APPROVED') return false
+      if (!this.canUseQuestionInSelection(question, actor, roleCode)) return false
+      return subjectFilter ? this.questionMatchesSubjectFilter(question, subjectFilter) : true
+    })
+
+    const gradePool = gradeFilter
+      ? subjectPool.filter((question) => this.questionMatchesGradeFilter(question.gradeLevel, gradeFilter))
+      : []
+    const schoolPool = schoolId
+      ? subjectPool.filter((question) => question.schoolId === schoolId)
+      : []
+
+    const candidatePool = gradePool.length >= target
+      ? gradePool
+      : schoolPool.length >= target
+        ? schoolPool
+        : subjectPool.length
+          ? subjectPool
+          : data.questions.filter((question) => question.status === 'APPROVED' && this.canUseQuestionInSelection(question, actor, roleCode))
+
+    return this.stableQuestionSelection(candidatePool, evaluation.id).slice(0, target)
+  }
+
+  private stableQuestionSelection(questions: Question[], seed: string) {
+    return [...questions].sort((first, second) => {
+      const firstKey = createHash('sha256').update(`${seed}:${first.id}`).digest('hex')
+      const secondKey = createHash('sha256').update(`${seed}:${second.id}`).digest('hex')
+      return firstKey.localeCompare(secondKey)
+    })
+  }
+
+  private safeDownloadSlug(value: unknown) {
+    return this.normalizeTextKey(value)
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 80)
+      || 'prova'
+  }
+
+  private questionMatchesGradeFilter(questionGrade: unknown, gradeFilter: string) {
+    const target = this.normalizeGradeKey(gradeFilter)
+    const current = this.normalizeGradeKey(questionGrade)
+    if (!target || !current) return true
+    if (target === current) return true
+    if (target.startsWith('em')) return current.startsWith('em') || current.includes('ensino medio') || current.includes('serie')
+
+    const targetYear = target.match(/^ef([1-9])$/)?.[1]
+    return Boolean(targetYear && (current === `ef${targetYear}` || current.includes(`${targetYear}o ano`) || current.includes(`${targetYear} ano`)))
+  }
+
+  private normalizeGradeKey(value: unknown) {
+    const text = this.normalizeTextKey(value)
+    if (!text) return ''
+    const direct = text.replace(/\s+/g, '')
+    if (/^e[fm][1-9]$/.test(direct)) return direct
+
+    const year = text.match(/\b([1-9])\b/)?.[1]
+    if (text.includes('medio') && year && Number(year) >= 1 && Number(year) <= 3) return `em${year}`
+    if (text.includes('fundamental') && year && Number(year) >= 1 && Number(year) <= 9) return `ef${year}`
+    if (text.includes('serie') && year && Number(year) >= 1 && Number(year) <= 3) return `em${year}`
+    if (text.includes('ano') && year && Number(year) >= 1 && Number(year) <= 9) return `ef${year}`
+
+    return text
+  }
+
+  private canUseQuestionInSelection(question: Question, actor: UserAccount, roleCode: RoleCode) {
+    if (question.sourceType === 'INEP_ENEM' || question.visibility === 'GLOBAL' || question.visibility === 'NETWORK') return true
+    if (question.visibility === 'PRIVATE') {
+      return question.createdById === actor.id || question.createdById === actor.linkedTeacherId
+    }
+    if (roleCode === 'ADMIN' || roleCode === 'DIRETOR' || roleCode === 'COORDENADOR') {
+      return !actor.schoolId || question.schoolId === actor.schoolId
+    }
+    return question.schoolId === actor.schoolId || question.createdById === actor.id || question.createdById === actor.linkedTeacherId
+  }
+
+  private questionMatchesSubjectFilter(question: Question, subjectFilter: string) {
+    const targetLanguage = this.getQuestionLanguageFromText(subjectFilter)
+    const source = this.normalizeTextKey([
+      question.subject,
+      question.component,
+      question.area,
+      question.sourceName,
+      this.metadataAcademicText(question.metadata),
+    ].join(' '))
+
+    const specificSubject = this.getSpecificSubjectFilter(subjectFilter)
+    if (specificSubject) return this.inferSpecificQuestionSubject(question) === specificSubject
+
+    if (source.includes(subjectFilter)) return true
+
+    if (targetLanguage) {
+      const questionLanguage = this.getQuestionLanguage(question)
+      if (targetLanguage === 'portugues') {
+        return questionLanguage ? questionLanguage === 'portugues' : this.getQuestionSubjectGroup(source) === 'linguagens'
+      }
+      return questionLanguage === targetLanguage
+    }
+
+    const targetGroup = this.getQuestionSubjectGroup(subjectFilter)
+    const questionGroup = this.getQuestionSubjectGroup(source)
+    return Boolean(targetGroup && questionGroup && targetGroup === questionGroup)
+  }
+
+  private getSpecificSubjectFilter(value: unknown): 'fisica' | 'quimica' | 'historia' | null {
+    const text = this.normalizeTextKey(value)
+    if (text === 'fisica') return 'fisica'
+    if (text === 'quimica') return 'quimica'
+    if (text === 'historia') return 'historia'
+    return null
+  }
+
+  private inferSpecificQuestionSubject(question: Question): 'fisica' | 'quimica' | 'historia' | null {
+    const source = this.normalizeTextKey([
+      question.subject,
+      question.component,
+      question.area,
+      question.sourceName,
+      this.metadataAcademicText(question.metadata),
+    ].join(' '))
+    const text = this.normalizeTextKey([
+      source,
+      question.title,
+      question.context,
+      question.statement,
+      question.explanation,
+      question.options.map((option) => option.text).join(' '),
+      question.skills.map((skill) => `${skill.code} ${skill.description} ${skill.knowledgeObject}`).join(' '),
+      question.descriptors.map((descriptor) => `${descriptor.code} ${descriptor.description}`).join(' '),
+    ].join(' '))
+    const skillNumbers = this.getQuestionSkillNumbers(question)
+    const hasSkill = (skillNumber: number) => skillNumbers.includes(skillNumber)
+    const areaIsNature = this.getQuestionSubjectGroup(question.area) === 'natureza'
+      || this.getQuestionSubjectGroup(question.subject) === 'natureza'
+      || source.includes('natureza')
+    const areaIsHuman = this.getQuestionSubjectGroup(question.area) === 'humanas'
+      || this.getQuestionSubjectGroup(question.subject) === 'humanas'
+      || source.includes('humanas')
+    const physicsTerms = ['velocidade', 'forca', 'energia', 'aceleracao', 'movimento', 'pressao', 'potencia', 'circuito', 'eletrica', 'onda', 'calor', 'temperatura']
+    const chemistryTerms = ['mol', 'reacao', 'atomo', 'molecula', 'substancia', 'quimica', 'solucao', 'ion', 'oxidacao', 'estequiometria']
+    const historyTerms = ['era vargas', 'revolucao francesa', 'ditadura militar', 'guerra fria', 'colonizacao', 'iluminismo', 'escravidao', 'industrializacao', 'republica velha', 'revolucao', 'guerra', 'ditadura', 'imperio']
+
+    if (source.includes('quimica')) return 'quimica'
+    if (source.includes('fisica') && !source.includes('educacao fisica')) return 'fisica'
+    if (source.includes('historia')) return 'historia'
+    if (areaIsNature && ((hasSkill(17) && this.hasAnyTextTerm(text, ['velocidade', 'forca', 'energia'])) || this.hasAnyTextTerm(text, physicsTerms))) return 'fisica'
+    if (areaIsNature && ((hasSkill(21) && this.hasAnyTextTerm(text, ['mol', 'reacao', 'atomo'])) || this.hasAnyTextTerm(text, chemistryTerms))) return 'quimica'
+    if (areaIsHuman && this.hasAnyTextTerm(text, historyTerms)) return 'historia'
+    return null
+  }
+
+  private hasAnyTextTerm(text: string, terms: string[]) {
+    return terms.some((term) => text.includes(this.normalizeTextKey(term)))
+  }
+
+  private getQuestionSkillNumbers(question: Question) {
+    const metadataValues = Object.entries(question.metadata ?? {})
+      .filter(([key]) => /habilidade|skill|ability|competencia|competence/i.test(key))
+      .flatMap(([, value]) => Array.isArray(value) ? value : [value])
+
+    return [
+      ...question.skills.map((skill) => skill.code),
+      ...metadataValues.map((value) => String(value ?? '')),
+    ].flatMap((value) => String(value).match(/\d+/g) ?? []).map(Number)
+  }
+
+  private getQuestionSubjectGroup(value: unknown) {
+    const text = this.normalizeTextKey(value)
+    if (!text) return null
+    if (text.includes('matematica')) return 'matematica'
+    if (/(linguagens|portugues|literatura|redacao|ingles|espanhol|educacao fisica)/.test(text)) return 'linguagens'
+    if (/(humanas|historia|geografia|filosofia|sociologia|sociais)/.test(text)) return 'humanas'
+    if (/(natureza|biologia|fisica|quimica|ciencias naturais)/.test(text) || text === 'ciencias') return 'natureza'
+    return null
+  }
+
+  private getQuestionLanguage(question: Question) {
+    const explicitLanguage = this.getQuestionLanguageFromText([
+      question.subject,
+      question.component,
+      question.area,
+      question.sourceName,
+      this.metadataAcademicText(question.metadata),
+    ].join(' '))
+    if (explicitLanguage) return explicitLanguage
+
+    if (question.sourceType !== 'INEP_ENEM' && this.getQuestionSubjectGroup(question.subject) !== 'linguagens') return null
+    return this.inferQuestionLanguageFromContent(question)
+  }
+
+  private getQuestionLanguageFromText(value: unknown): 'ingles' | 'espanhol' | 'portugues' | null {
+    const text = this.normalizeTextKey(value)
+    if (/\b(ingles|lingua inglesa|english|foreign language english|idioma ingles)\b/.test(text)) return 'ingles'
+    if (/\b(espanhol|lingua espanhola|spanish|espanol|castellano|idioma espanhol)\b/.test(text)) return 'espanhol'
+    if (/\b(portugues|lingua portuguesa|literatura|redacao)\b/.test(text)) return 'portugues'
+    return null
+  }
+
+  private metadataAcademicText(metadata: Question['metadata']) {
+    return Object.values(metadata ?? {})
+      .flatMap((value) => Array.isArray(value) ? value : [value])
+      .filter((value) => ['string', 'number', 'boolean'].includes(typeof value))
+      .map((value) => String(value))
+      .join(' ')
+  }
+
+  private inferQuestionLanguageFromContent(question: Question): 'ingles' | 'espanhol' | null {
+    const text = this.normalizeTextKey([
+      question.statement,
+      question.context,
+      question.options.map((option) => option.text).join(' '),
+    ].join(' ').slice(0, 6000))
+    const tokens = text.match(/[a-z]+/g) ?? []
+    const englishWords = new Set(['the', 'and', 'of', 'to', 'in', 'is', 'are', 'was', 'were', 'for', 'with', 'on', 'from', 'by', 'about', 'people', 'world', 'not', 'can', 'will', 'would', 'have', 'has', 'had', 'this', 'that', 'they', 'their', 'them', 'you', 'your', 'we', 'our', 'what', 'when', 'where', 'why', 'how', 'which', 'who', 'because', 'there'])
+    const spanishWords = new Set(['el', 'los', 'las', 'una', 'unas', 'unos', 'que', 'para', 'con', 'por', 'como', 'pero', 'mas', 'muy', 'esta', 'este', 'estos', 'estas', 'son', 'fue', 'era', 'tiene', 'tienen', 'desde', 'sobre', 'cuando', 'donde', 'porque', 'usted', 'nosotros', 'ellos', 'ellas', 'mundo', 'personas', 'tambien'])
+    const englishScore = tokens.reduce((score, token) => score + (englishWords.has(token) ? 1 : 0), 0)
+    const spanishScore = tokens.reduce((score, token) => score + (spanishWords.has(token) ? 1 : 0), 0)
+
+    if (englishScore >= 8 && englishScore >= spanishScore + 4) return 'ingles'
+    if (spanishScore >= 8 && spanishScore >= englishScore + 4) return 'espanhol'
+    return null
+  }
+
+  private buildMixedQuestionSelection(questions: Question[], target: number) {
+    const enemPool = this.shuffleItems(questions.filter((question) => question.sourceType === 'INEP_ENEM'))
+    const systemPool = this.shuffleItems(questions.filter((question) => question.sourceType !== 'INEP_ENEM'))
+    const enemTarget = Math.ceil(target / 2)
+    const selected = [...enemPool.slice(0, enemTarget), ...systemPool.slice(0, target - enemTarget)]
+    const selectedIds = new Set(selected.map((question) => question.id))
+    const remainder = this.shuffleItems(questions.filter((question) => !selectedIds.has(question.id))).slice(0, target - selected.length)
+    return this.shuffleItems([...selected, ...remainder]).slice(0, target)
   }
 
   private ensureSchoolExists(data: { schools: School[] }, schoolId: string) {
@@ -1745,19 +3814,31 @@ export class LiensinaService {
   }
 
   private async fetchJsonWithTimeout<T>(url: string): Promise<T> {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 30000)
+    let lastError: unknown = null
 
-    try {
-      const response = await fetch(url, {
-        headers: { Accept: 'application/json' },
-        signal: controller.signal,
-      })
-      if (!response.ok) throw new BadRequestException(`Nao foi possivel buscar questoes do ENEM em ${url}.`)
-      return await response.json() as T
-    } finally {
-      clearTimeout(timeout)
+    for (let attempt = 1; attempt <= 6; attempt += 1) {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 30000)
+
+      try {
+        const response = await fetch(url, {
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        })
+        if (!response.ok) throw new BadRequestException(`Nao foi possivel buscar questoes do ENEM em ${url}.`)
+        return await response.json() as T
+      } catch (error) {
+        lastError = error
+        if (attempt === 6) break
+        await new Promise((resolveRetry) => setTimeout(resolveRetry, attempt * 3000))
+      } finally {
+        clearTimeout(timeout)
+      }
     }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new BadRequestException(`Nao foi possivel buscar questoes do ENEM em ${url}.`)
   }
 
   private async fetchImageWithTimeout(url: string): Promise<DownloadedQuestionImage | null> {
@@ -1860,7 +3941,7 @@ export class LiensinaService {
   private toEnemQuestion(apiQuestion: EnemDevQuestion, actorId: string): Question {
     const year = Number(apiQuestion.year)
     const index = Number(apiQuestion.index)
-    if (!Number.isInteger(year) || !Number.isInteger(index)) throw new BadRequestException('Questao ENEM sem ano ou indice valido.')
+    if (!Number.isInteger(year) || !Number.isInteger(index)) throw new BadRequestException('Questão ENEM sem ano ou índice válido.')
 
     const now = new Date().toISOString()
     const discipline = this.resolveEnemDiscipline(apiQuestion.discipline)
@@ -1891,7 +3972,7 @@ export class LiensinaService {
       fileUrl,
       fileType: 'IMAGE' as const,
       position: files.includes(fileUrl) ? 'CONTEXT' as const : 'OPTION' as const,
-      altText: files.includes(fileUrl) ? `Imagem de apoio da questao ${index} do ENEM ${year}` : `Imagem de alternativa da questao ${index} do ENEM ${year}`,
+      altText: files.includes(fileUrl) ? `Imagem de apoio da questão ${index} do ENEM ${year}` : `Imagem de alternativa da questão ${index} do ENEM ${year}`,
       order: fileIndex + 1,
       metadata: { source: 'enem.dev' },
       createdAt: now,
@@ -1902,13 +3983,13 @@ export class LiensinaService {
       schoolId: 'global-school',
       networkId: 'global-network',
       createdById: actorId,
-      title: String(apiQuestion.title ?? `Questao ${index} - ENEM ${year}`).trim(),
+      title: String(apiQuestion.title ?? `Questão ${index} - ENEM ${year}`).trim(),
       context: String(apiQuestion.context ?? '').trim(),
-      statement: String(apiQuestion.alternativesIntroduction ?? apiQuestion.title ?? `Questao ${index} - ENEM ${year}`).trim(),
+      statement: String(apiQuestion.alternativesIntroduction ?? apiQuestion.title ?? `Questão ${index} - ENEM ${year}`).trim(),
       explanation: correctAlternative ? `Gabarito informado pela API ENEM: alternativa ${correctAlternative}.` : '',
       type: 'MULTIPLE_CHOICE',
       stage: 'MEDIO',
-      gradeLevel: 'Ensino Medio',
+      gradeLevel: 'Ensino Médio',
       area: discipline.area,
       component: discipline.component,
       subject: discipline.subject,
@@ -1918,7 +3999,7 @@ export class LiensinaService {
       sourceYear: year,
       sourceExternalId,
       sourceUrl: `${enemApiBaseUrl}/${year}/questions`,
-      licenseNotes: 'Questao importada da API publica enem.dev para uso no banco de questoes.',
+      licenseNotes: 'Questão importada da API pública enem.dev para uso no banco de questões.',
       visibility: 'GLOBAL',
       status: 'APPROVED',
       isEditable: false,
@@ -1949,7 +4030,7 @@ export class LiensinaService {
         questionId,
         reviewerId: actorId,
         status: 'APPROVED',
-        comment: 'Questao importada automaticamente da API ENEM.',
+        comment: 'Questão importada automaticamente da API ENEM.',
         reviewedAt: now,
       }],
     }
@@ -2006,7 +4087,7 @@ export class LiensinaService {
       availableOfficialYears: defaultEnemYears,
       unavailableOfficialYears: [],
       reasonUnavailable: 'A integracao automatica usa a API enem.dev para os anos de 2009 a 2023.',
-      recommendedAction: 'Buscar questoes por ano em https://api.enem.dev/v1/exams/{ano}/questions, persistir no banco com sourceYear, sourceExternalId, disciplina, numero da questao, arquivos e gabarito.',
+      recommendedAction: 'Buscar questões por ano em https://api.enem.dev/v1/exams/{ano}/questions, persistir no banco com sourceYear, sourceExternalId, disciplina, número da questão, arquivos e gabarito.',
       itemsToImport,
       active: true,
       metadata: {
@@ -2072,7 +4153,7 @@ export class LiensinaService {
 
   private ensureQuestionIdsExist(data: { questions: Question[] }, questionIds: string[]) {
     const invalidQuestionId = questionIds.find((questionId) => !data.questions.some((question) => question.id === questionId))
-    if (invalidQuestionId) throw new BadRequestException('A prova contem questao inexistente no banco.')
+    if (invalidQuestionId) throw new BadRequestException('A prova contém questão inexistente no banco.')
   }
 
   private toQuestionDescriptorSummary(
@@ -2100,7 +4181,7 @@ export class LiensinaService {
   private normalizeQuestionType(value: unknown): QuestionType {
     const type = String(value ?? '').trim().toUpperCase()
     if (type === 'MULTIPLE_CHOICE') return type
-    throw new BadRequestException('Tipo de questao invalido.')
+    throw new BadRequestException('Tipo de questão inválido.')
   }
 
   private normalizeDifficulty(value: unknown): Difficulty {
@@ -2120,13 +4201,13 @@ export class LiensinaService {
       sourceType === 'SCHOOL_BANK' ||
       sourceType === 'GLOBAL_CURATED'
     ) return sourceType
-    throw new BadRequestException('Fonte da questao invalida.')
+    throw new BadRequestException('Fonte da questão inválida.')
   }
 
   private normalizeQuestionVisibility(value: unknown): QuestionVisibility {
     const visibility = String(value ?? '').trim().toUpperCase()
     if (visibility === 'PRIVATE' || visibility === 'SCHOOL' || visibility === 'NETWORK' || visibility === 'GLOBAL') return visibility
-    throw new BadRequestException('Visibilidade da questao invalida.')
+    throw new BadRequestException('Visibilidade da questão inválida.')
   }
 
   private normalizeQuestionStatus(value: unknown, fallback: QuestionStatus): QuestionStatus {
@@ -2167,6 +4248,41 @@ export class LiensinaService {
     const actor = data.users.find((user) => user.id === actorId)?.name ?? 'Sistema'
     data.auditEvents.unshift({ id: this.createId('aud'), actor, action, target, createdAt: new Date().toISOString() })
     data.auditEvents = data.auditEvents.slice(0, 80)
+  }
+
+  private pushMealRequestHistory(
+    data: { mealRequestHistory: MealRequestHistory[]; roles: Role[] },
+    actor: UserAccount,
+    action: MealRequestHistoryAction,
+    request: MealFoodRequest,
+    oldValue: unknown,
+    newValue: unknown,
+    description: string,
+  ) {
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    data.mealRequestHistory.unshift({
+      id: this.createId('meal-request-history'),
+      action,
+      entityType: 'FOOD_REQUEST',
+      entityId: request.id,
+      userId: actor.id,
+      userRole: roleCode,
+      schoolId: request.schoolId,
+      oldValue,
+      newValue,
+      description,
+      createdAt: new Date().toISOString(),
+    })
+    data.mealRequestHistory = data.mealRequestHistory.slice(0, 300)
+  }
+
+  private describeFoodRequestHistory(action: MealRequestHistoryAction, request: MealFoodRequest) {
+    if (action === 'APPROVED_FOOD_REQUEST') return `Nutricionista aprovou a solicitacao de ${request.quantity} ${request.unit} de ${request.itemName}`
+    if (action === 'REJECTED_FOOD_REQUEST') return `Nutricionista reprovou a solicitacao de ${request.itemName}`
+    if (action === 'REQUESTED_FOOD_ADJUSTMENT') return `Nutricionista pediu ajuste na solicitacao de ${request.itemName}`
+    if (action === 'CANCELLED_FOOD_REQUEST') return `Criador cancelou a solicitacao de ${request.itemName}`
+    if (action === 'ADDED_FOOD_REQUEST_TO_STOCK') return `Admin adicionou ${request.itemName} ao estoque oficial`
+    return `Solicitacao de ${request.itemName} atualizada`
   }
 
   private ensureRequired<T extends object>(payload: T, keys: Array<keyof T>) {
@@ -2257,6 +4373,10 @@ export class LiensinaService {
       if (teacher) {
         teacher.name = updated.name
         teacher.email = updated.email
+        teacher.avatarUrl = updated.avatarUrl
+        teacher.bannerUrl = updated.bannerUrl
+        teacher.avatarObject = updated.avatarObject
+        teacher.bannerObject = updated.bannerObject
       }
     }
 
@@ -2266,32 +4386,55 @@ export class LiensinaService {
         guardian.name = updated.name
         guardian.email = updated.email
         guardian.phone = updated.phone
+        guardian.avatarUrl = updated.avatarUrl
+        guardian.bannerUrl = updated.bannerUrl
+        guardian.avatarObject = updated.avatarObject
+        guardian.bannerObject = updated.bannerObject
       }
     }
 
     if (previous.linkedStudentId) {
       const student = data.students.find((item) => item.id === previous.linkedStudentId)
-      if (student) student.name = updated.name
+      if (student) {
+        student.name = updated.name
+        student.avatarUrl = updated.avatarUrl
+        student.bannerUrl = updated.bannerUrl
+        student.avatarObject = updated.avatarObject
+        student.bannerObject = updated.bannerObject
+      }
     }
   }
 
-  private saveProfileImageFile(actorId: string, file: ProfileImageFile, folder: 'avatars' | 'banners') {
+  private saveProfileImageFile(actorId: string, file: ProfileImageFile, folder: 'avatars' | 'banners'): StoredImageObject {
     if (!file.mimetype.startsWith('image/')) throw new BadRequestException('Envie uma imagem valida para o perfil.')
 
+    const bucket = this.getProfileMediaBucket()
     const extensionFromMime = file.mimetype.split('/')[1]?.replace('jpeg', 'jpg')
     const extensionFromName = extname(file.originalname).replace(/^\./, '').toLowerCase()
     const extension = (extensionFromMime || extensionFromName || 'jpg').replace(/[^a-z0-9]/g, '')
-    const uploadsDir = join(process.cwd(), 'uploads', folder)
-    const fileName = `${actorId}-${randomUUID()}.${extension}`
+    const key = `profile/${folder}/${actorId}/${randomUUID()}.${extension}`
+    const uploadsDir = join(process.cwd(), 'uploads', bucket)
 
-    mkdirSync(uploadsDir, { recursive: true })
-    writeFileSync(join(uploadsDir, fileName), file.buffer)
+    const filePath = join(uploadsDir, key)
+    mkdirSync(dirname(filePath), { recursive: true })
+    writeFileSync(filePath, file.buffer)
 
-    return `/uploads/${folder}/${fileName}`
+    return {
+      storageProvider: 'local',
+      bucket,
+      key,
+      publicUrl: `/uploads/${bucket}/${key}`,
+      contentType: file.mimetype,
+      sizeBytes: file.size,
+      originalName: file.originalname,
+      uploadedAt: new Date().toISOString(),
+    }
   }
 
-  private deleteProfileImageFile(fileUrl?: string) {
-    const cleanUrl = String(fileUrl ?? '').split(/[?#]/)[0]
+  private deleteProfileImageFile(file?: string | StoredImageObject | null) {
+    const cleanUrl = typeof file === 'object' && file
+      ? `/uploads/${file.bucket}/${file.key}`
+      : String(file ?? '').split(/[?#]/)[0]
     if (!cleanUrl.startsWith('/uploads/')) return
 
     const relativePath = cleanUrl.replace(/^\/uploads\//, '')
@@ -2309,6 +4452,14 @@ export class LiensinaService {
     }
   }
 
+  private getProfileMediaBucket() {
+    return String(this.configService.get<string>('PROFILE_MEDIA_BUCKET') ?? 'liensina-profile-media')
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]/g, '-')
+      .replace(/^-+|-+$/g, '')
+      || 'liensina-profile-media'
+  }
+
   private average(values: number[]) {
     if (!values.length) return 0
     return values.reduce((sum, value) => sum + value, 0) / values.length
@@ -2316,6 +4467,43 @@ export class LiensinaService {
 
   private createId(_prefix: string) {
     return randomUUID()
+  }
+
+  private resolveUserSchoolId(data: DatabaseShape, user: UserAccount) {
+    if (user.schoolId && data.schools.some((school) => school.id === user.schoolId)) return user.schoolId
+
+    if (user.linkedTeacherId) {
+      const teacher = data.teachers.find((item) => item.id === user.linkedTeacherId || item.userId === user.id)
+      if (teacher?.schoolId) return teacher.schoolId
+    }
+
+    if (user.linkedStudentId) {
+      const student = data.students.find((item) => item.id === user.linkedStudentId || item.userId === user.id)
+      if (student?.schoolId) return student.schoolId
+    }
+
+    if (user.linkedGuardianId) {
+      const guardian = data.guardians.find((item) => item.id === user.linkedGuardianId || item.userId === user.id)
+      if (guardian?.schoolId) return guardian.schoolId
+    }
+
+    const teacher = data.teachers.find((item) => item.userId === user.id)
+    if (teacher?.schoolId) return teacher.schoolId
+
+    const student = data.students.find((item) => item.userId === user.id)
+    if (student?.schoolId) return student.schoolId
+
+    const guardian = data.guardians.find((item) => item.userId === user.id)
+    if (guardian?.schoolId) return guardian.schoolId
+
+    return null
+  }
+
+  private toPublicUserWithResolvedSchool(data: DatabaseShape, user: UserAccount): PublicUserAccount {
+    return {
+      ...this.toPublicUser(user),
+      schoolId: this.resolveUserSchoolId(data, user),
+    }
   }
 
   private toPublicUser(user: UserAccount): PublicUserAccount {

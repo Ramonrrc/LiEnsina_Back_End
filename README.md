@@ -1,6 +1,6 @@
 # LiEnsina Back End
 
-API NestJS do LiEnsina com persistencia em SQLite e autenticacao JWT.
+API NestJS do LiEnsina com persistencia em PostgreSQL/SQLite e autenticacao JWT.
 
 ## Autenticacao
 
@@ -24,8 +24,49 @@ A API sobe em `http://localhost:3001/api`.
 
 ## Banco
 
-Por padrao, os dados ficam em `data/liensina.sqlite`.
+O runtime atual usa a tabela `collections`. No SQLite antigo, `payload` era `TEXT` com JSON; no PostgreSQL, `payload` passa a ser `jsonb`, com `name` como chave primaria e validacao para garantir arrays JSON.
 
-O backend nao carrega dados automaticos de exemplo. Se o SQLite estiver vazio, a API inicia com colecoes vazias e aguarda dados reais cadastrados ou migrados para o banco.
+Variaveis principais:
 
-As colecoes usadas pela aplicacao ficam na tabela `collections`, com payloads persistidos no SQLite. Arquivos antigos em JSON nao sao mais lidos pelo runtime.
+- `DATABASE_DRIVER=postgres` para PostgreSQL, `sqlite` para rollback local.
+- `DATABASE_URL=postgresql://usuario:senha@host:5432/banco`.
+- `DATABASE_SSL=true` ou `require` para Neon.
+- `DATABASE_PATH=data/liensina.sqlite` para o SQLite legado.
+
+## Migracao SQLite -> PostgreSQL
+
+1. Garanta que o backend esteja parado para congelar escritas no SQLite.
+2. Configure `.env` com `DATABASE_URL`.
+3. Rode backup:
+
+```bash
+npm run db:backup:sqlite
+```
+
+4. Migre os dados:
+
+```bash
+npm run db:migrate:postgres
+```
+
+Se o PostgreSQL ja tiver linhas em `collections`, o script aborta. Para substituir conscientemente:
+
+```bash
+POSTGRES_MIGRATION_OVERWRITE=true npm run db:migrate:postgres
+```
+
+5. Verifique contagens por colecao:
+
+```bash
+npm run db:verify:postgres
+```
+
+6. Suba a API com `DATABASE_DRIVER=postgres`.
+
+Rollback para SQLite:
+
+```bash
+npm run db:rollback:sqlite -- data/backups/liensina.sqlite.backup-AAAA-MM-DDTHH-mm-ss-sssZ
+```
+
+Depois defina `DATABASE_DRIVER=sqlite` e mantenha `DATABASE_PATH` apontando para o arquivo restaurado.

@@ -14,6 +14,7 @@ FROM node:22-alpine AS production
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=3001
+ENV DATABASE_DRIVER=postgres
 ENV DATABASE_PATH=/app/data/liensina.sqlite
 ENV JWT_ACCESS_EXPIRES_IN=30m
 ENV REFRESH_TOKEN_DAYS=7
@@ -25,8 +26,9 @@ COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
+COPY scripts ./scripts
 
-RUN mkdir -p /app/data && chown -R node:node /app
+RUN mkdir -p /app/data /app/uploads && chown -R node:node /app
 USER node
 
 EXPOSE 3001

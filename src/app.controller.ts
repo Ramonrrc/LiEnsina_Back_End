@@ -3,8 +3,9 @@ import { FileInterceptor } from '@nestjs/platform-express'
 import type { Request, Response } from 'express'
 
 import { AuthGuard, type RequestWithUser } from './auth.guard'
+import { DatabaseService } from './database.service'
 import { LiensinaService } from './liensina.service'
-import type { ClassRoom, CreateMealFoodPayload, CreateMealItemPayload, CreateMealManagementPayload, CreateQuestionRequest, Evaluation, Guardian, Role, School, SchoolCalendarEvent, Student, Teacher, UpdateMealBudgetPayload, UpsertMealMenuPayload, UserAccount } from './liensina.types'
+import type { AddMealFoodRequestToStockPayload, ClassRoom, CreateMealFoodPayload, CreateMealFoodRequestPayload, CreateMealItemPayload, CreateMealManagementPayload, CreateQuestionRequest, Evaluation, EvaluationCorrectionReviewPayload, GenerateQuestionSelectionRequest, Guardian, LessonRecord, ReviewMealFoodRequestPayload, Role, RoomReservation, School, SchoolCalendarEvent, Student, Teacher, UpdateMealBudgetPayload, UpdateMealFoodRequestPayload, UpsertMealMenuPayload, UserAccount } from './liensina.types'
 
 type UploadedProfileImageFile = {
   buffer: Buffer
@@ -13,15 +14,23 @@ type UploadedProfileImageFile = {
   size: number
 }
 
+type UploadedOmrImageFile = UploadedProfileImageFile
+
 const refreshCookieName = 'liensina_refresh_token'
+const maxAvatarUploadBytes = 10 * 1024 * 1024
+const maxBannerUploadBytes = 15 * 1024 * 1024
+const maxOmrUploadBytes = 16 * 1024 * 1024
 
 @Controller()
 export class AppController {
-  constructor(private readonly liensinaService: LiensinaService) {}
+  constructor(
+    private readonly liensinaService: LiensinaService,
+    private readonly databaseService: DatabaseService,
+  ) {}
 
   @Get('health')
   health() {
-    return { status: 'ok', app: 'LiEnsina_Back_End', database: 'sqlite', timestamp: new Date().toISOString() }
+    return { status: 'ok', app: 'LiEnsina_Back_End', database: this.databaseService.getDriver(), timestamp: new Date().toISOString() }
   }
 
   @Post('auth/login')
@@ -77,8 +86,42 @@ export class AppController {
 
   @UseGuards(AuthGuard)
   @Get('screens/dashboard')
-  dashboardScreen(@Req() request: RequestWithUser) {
-    return this.liensinaService.getDashboardScreen(request.user!.id)
+  dashboardScreen(
+    @Req() request: RequestWithUser,
+    @Query('alertPage') alertPage = '1',
+    @Query('alertLimit') alertLimit = '10',
+  ) {
+    return this.liensinaService.getDashboardScreen(request.user!.id, alertPage, alertLimit)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('screens/notifications')
+  notificationsScreen(@Req() request: RequestWithUser) {
+    return this.liensinaService.getNotificationsScreen(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('notifications')
+  notifications(@Req() request: RequestWithUser) {
+    return this.liensinaService.getNotificationsScreen(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('notifications/read-all')
+  markAllNotificationsRead(@Req() request: RequestWithUser) {
+    return this.liensinaService.markAllNotificationsRead(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('notifications/:id/read')
+  markNotificationRead(@Req() request: RequestWithUser, @Param('id') id: string) {
+    return this.liensinaService.markNotificationRead(request.user!.id, id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('notifications/:id/unread')
+  markNotificationUnread(@Req() request: RequestWithUser, @Param('id') id: string) {
+    return this.liensinaService.markNotificationUnread(request.user!.id, id)
   }
 
   @UseGuards(AuthGuard)
@@ -113,8 +156,8 @@ export class AppController {
 
   @UseGuards(AuthGuard)
   @Get('meal-managements/school-page')
-  listMealManagementSchoolPage(@Req() request: RequestWithUser, @Query('page') page = '1', @Query('limit') limit = '5') {
-    return this.liensinaService.listMealManagementSchoolPage(request.user!.id, page, limit)
+  listMealManagementSchoolPage(@Req() request: RequestWithUser, @Query('page') page = '1', @Query('limit') limit = '5', @Query('search') search = '') {
+    return this.liensinaService.listMealManagementSchoolPage(request.user!.id, page, limit, search)
   }
 
   @UseGuards(AuthGuard)
@@ -196,6 +239,19 @@ export class AppController {
   }
 
   @UseGuards(AuthGuard)
+  @Get('teachers')
+  listTeachers(
+    @Req() request: RequestWithUser,
+    @Query('page') page = '1',
+    @Query('limit') limit = '10',
+    @Query('search') search = '',
+    @Query('schoolId') schoolId = 'all',
+    @Query('discipline') discipline = 'all',
+  ) {
+    return this.liensinaService.listTeachersPage(request.user!.id, page, limit, search, schoolId, discipline)
+  }
+
+  @UseGuards(AuthGuard)
   @Post('teachers')
   createTeacher(@Req() request: RequestWithUser, @Body() body: Partial<Teacher> & { classId?: string; password?: string; phone?: string }) {
     return this.liensinaService.createTeacher(request.user!.id, body)
@@ -205,6 +261,19 @@ export class AppController {
   @Patch('teachers/:id')
   updateTeacher(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: Partial<Teacher> & { classId?: string }) {
     return this.liensinaService.updateTeacher(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('students')
+  listStudents(
+    @Req() request: RequestWithUser,
+    @Query('page') page = '1',
+    @Query('limit') limit = '10',
+    @Query('search') search = '',
+    @Query('schoolId') schoolId = 'all',
+    @Query('discipline') discipline = 'all',
+  ) {
+    return this.liensinaService.listStudentsPage(request.user!.id, page, limit, search, schoolId, discipline)
   }
 
   @UseGuards(AuthGuard)
@@ -238,9 +307,48 @@ export class AppController {
   }
 
   @UseGuards(AuthGuard)
+  @Get('evaluations/:id/download')
+  async downloadEvaluation(@Req() request: RequestWithUser, @Param('id') id: string, @Res() response: Response) {
+    const file = await this.liensinaService.getEvaluationDownload(request.user!.id, id)
+    response.setHeader('Content-Type', file.contentType)
+    response.setHeader('Content-Disposition', this.contentDispositionAttachment(file.filename))
+    response.setHeader('Cache-Control', 'no-store')
+    return response.sendFile(file.filePath)
+  }
+
+  @UseGuards(AuthGuard)
   @Delete('evaluations/:id')
   deleteEvaluation(@Req() request: RequestWithUser, @Param('id') id: string) {
     return this.liensinaService.deleteEvaluation(request.user!.id, id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('evaluations/:id/students/:studentId/omr')
+  @UseInterceptors(FileInterceptor('image', {
+    limits: { fileSize: maxOmrUploadBytes },
+    fileFilter: (_req, file, callback) => {
+      const isSupported = file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf'
+      if (!isSupported) {
+        callback(new BadRequestException('Envie uma imagem ou PDF valido do cartao resposta.'), false)
+        return
+      }
+      callback(null, true)
+    },
+  }))
+  processEvaluationOmr(
+    @Req() request: RequestWithUser,
+    @Param('id') id: string,
+    @Param('studentId') studentId: string,
+    @UploadedFile() file?: UploadedOmrImageFile,
+  ) {
+    if (!file) throw new BadRequestException('Envie a imagem ou PDF do cartao resposta.')
+    return this.liensinaService.processEvaluationOmrCorrection(request.user!.id, id, studentId, file)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('evaluation-corrections/:id/review')
+  reviewEvaluationCorrection(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: EvaluationCorrectionReviewPayload) {
+    return this.liensinaService.reviewEvaluationCorrection(request.user!.id, id, body)
   }
 
   @UseGuards(AuthGuard)
@@ -250,9 +358,75 @@ export class AppController {
   }
 
   @UseGuards(AuthGuard)
+  @Post('questions/generate-selection')
+  generateQuestionSelection(@Req() request: RequestWithUser, @Body() body: GenerateQuestionSelectionRequest) {
+    return this.liensinaService.generateQuestionSelection(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Delete('questions/:id')
+  deleteQuestion(@Req() request: RequestWithUser, @Param('id') id: string) {
+    return this.liensinaService.deleteQuestion(request.user!.id, id)
+  }
+
+  @UseGuards(AuthGuard)
   @Post('meal-managements/:id/items')
   createMealItem(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: CreateMealItemPayload) {
     return this.liensinaService.createMealItem(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('meal-food-requests')
+  createMealFoodRequest(@Req() request: RequestWithUser, @Body() body: CreateMealFoodRequestPayload) {
+    return this.liensinaService.createMealFoodRequest(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Patch('meal-food-requests/:id')
+  updateMealFoodRequest(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: UpdateMealFoodRequestPayload) {
+    return this.liensinaService.updateMealFoodRequest(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Delete('meal-food-requests/:id')
+  deleteMealFoodRequest(@Req() request: RequestWithUser, @Param('id') id: string) {
+    return this.liensinaService.deleteMealFoodRequest(request.user!.id, id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('meal-food-requests/:id/review')
+  reviewMealFoodRequest(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: ReviewMealFoodRequestPayload) {
+    return this.liensinaService.reviewMealFoodRequest(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('meal-food-requests/:id/add-to-stock')
+  addMealFoodRequestToStock(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: AddMealFoodRequestToStockPayload) {
+    return this.liensinaService.addMealFoodRequestToStock(request.user!.id, id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('room-reservations')
+  listRoomReservations(@Req() request: RequestWithUser) {
+    return this.liensinaService.listRoomReservations(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('room-reservations')
+  createRoomReservation(@Req() request: RequestWithUser, @Body() body: Partial<RoomReservation>) {
+    return this.liensinaService.createRoomReservation(request.user!.id, body)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('lesson-records')
+  listLessonRecords(@Req() request: RequestWithUser) {
+    return this.liensinaService.listLessonRecords(request.user!.id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('lesson-records')
+  createLessonRecord(@Req() request: RequestWithUser, @Body() body: Partial<LessonRecord>) {
+    return this.liensinaService.createLessonRecord(request.user!.id, body)
   }
 
   @UseGuards(AuthGuard)
@@ -292,6 +466,24 @@ export class AppController {
   }
 
   @UseGuards(AuthGuard)
+  @Patch('users/:id/school')
+  updateUserSchool(@Req() request: RequestWithUser, @Param('id') id: string, @Body() body: { schoolId: string | null }) {
+    return this.liensinaService.updateUserSchool(request.user!.id, id, body.schoolId)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('users/search')
+  searchUsers(
+    @Req() request: RequestWithUser,
+    @Query('search') search = '',
+    @Query('schoolId') schoolId = 'all',
+    @Query('kind') kind = 'all',
+    @Query('limit') limit = '10',
+  ) {
+    return this.liensinaService.searchAccessUsers(request.user!.id, search, schoolId, kind, limit)
+  }
+
+  @UseGuards(AuthGuard)
   @Patch('profile')
   updateProfile(@Req() request: RequestWithUser, @Body() body: Partial<UserAccount>) {
     return this.liensinaService.updateProfile(request.user!.id, body)
@@ -300,7 +492,7 @@ export class AppController {
   @UseGuards(AuthGuard)
   @Patch('profile/avatar')
   @UseInterceptors(FileInterceptor('avatar', {
-    limits: { fileSize: 2 * 1024 * 1024 },
+    limits: { fileSize: maxAvatarUploadBytes },
     fileFilter: (_request: unknown, file: { mimetype: string }, callback: (error: Error | null, acceptFile: boolean) => void) => {
       if (!file.mimetype.startsWith('image/')) {
         callback(new BadRequestException('Envie uma imagem valida para o avatar.'), false)
@@ -323,7 +515,7 @@ export class AppController {
   @UseGuards(AuthGuard)
   @Patch('profile/banner')
   @UseInterceptors(FileInterceptor('banner', {
-    limits: { fileSize: 4 * 1024 * 1024 },
+    limits: { fileSize: maxBannerUploadBytes },
     fileFilter: (_request: unknown, file: { mimetype: string }, callback: (error: Error | null, acceptFile: boolean) => void) => {
       if (!file.mimetype.startsWith('image/')) {
         callback(new BadRequestException('Envie uma imagem valida para o banner.'), false)
@@ -386,6 +578,17 @@ export class AppController {
     if (process.env.AUTH_COOKIE_SECURE === 'true') return true
     if (process.env.AUTH_COOKIE_SECURE === 'false') return false
     return process.env.NODE_ENV === 'production'
+  }
+
+  private contentDispositionAttachment(filename: string) {
+    const asciiFallback = filename
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^\x20-\x7E]/g, '_')
+      .replace(/["\\]/g, '_')
+      || 'prova.pdf'
+
+    return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`
   }
 }
 

@@ -3,6 +3,7 @@ import type { DatabaseShape } from './liensina.types'
 export const databaseCollections: Array<keyof DatabaseShape> = [
   'users',
   'refreshSessions',
+  'notifications',
   'roles',
   'schools',
   'teachers',
@@ -10,6 +11,7 @@ export const databaseCollections: Array<keyof DatabaseShape> = [
   'students',
   'classes',
   'evaluations',
+  'evaluationCorrections',
   'curriculumBases',
   'curriculumSkills',
   'assessmentPrograms',
@@ -17,9 +19,13 @@ export const databaseCollections: Array<keyof DatabaseShape> = [
   'assessmentDescriptors',
   'questions',
   'questionImportPlans',
+  'lessonRecords',
+  'roomReservations',
   'calendarEvents',
   'mealFoods',
   'mealManagements',
+  'mealFoodRequests',
+  'mealRequestHistory',
   'auditEvents',
 ]
 
@@ -27,6 +33,7 @@ export function createEmptyDatabase(): DatabaseShape {
   return {
     users: [],
     refreshSessions: [],
+    notifications: [],
     roles: [],
     schools: [],
     teachers: [],
@@ -34,6 +41,7 @@ export function createEmptyDatabase(): DatabaseShape {
     students: [],
     classes: [],
     evaluations: [],
+    evaluationCorrections: [],
     curriculumBases: [],
     curriculumSkills: [],
     assessmentPrograms: [],
@@ -41,9 +49,13 @@ export function createEmptyDatabase(): DatabaseShape {
     assessmentDescriptors: [],
     questions: [],
     questionImportPlans: [],
+    lessonRecords: [],
+    roomReservations: [],
     calendarEvents: [],
     mealFoods: [],
     mealManagements: [],
+    mealFoodRequests: [],
+    mealRequestHistory: [],
     auditEvents: [],
   }
 }

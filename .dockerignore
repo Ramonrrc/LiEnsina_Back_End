@@ -8,9 +8,13 @@ coverage
 !.env.example
 
 data/*.json
+data/*.sqlite
+data/*.sqlite3
+data/backups
+data/*.backup-*
+uploads
 
 .git
 .gitignore
 Dockerfile
 docker-compose*.yml
-
