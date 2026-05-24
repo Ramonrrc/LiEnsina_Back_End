@@ -1,7 +1,7 @@
-import { Logger } from '@nestjs/common'
+import { Logger, ValidationPipe } from '@nestjs/common'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { static as serveStatic } from 'express'
+import { json, static as serveStatic, urlencoded, type NextFunction, type Request, type Response } from 'express'
 import { ConfigService } from '@nestjs/config'
 import { NestFactory } from '@nestjs/core'
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger'
@@ -42,6 +42,7 @@ function isAllowedDevOrigin(origin: string) {
 async function bootstrap() {
   const app = await NestFactory.create(AppModule)
   const config = app.get(ConfigService)
+  const corsLogger = new Logger('Cors')
   const origins = (config.get<string>('CORS_ORIGINS') ?? '')
     .split(',')
     .map((origin) => origin.trim())
@@ -49,31 +50,61 @@ async function bootstrap() {
   const allowedOrigins = new Set(origins)
 
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }))
+  app.use(json({ limit: config.get<string>('MAX_JSON_BODY_SIZE') ?? '1mb' }))
+  app.use(urlencoded({ extended: false, limit: config.get<string>('MAX_FORM_BODY_SIZE') ?? '256kb' }))
+  app.useGlobalPipes(new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+  }))
 
-  const uploadsDir = join(process.cwd(), 'uploads')
-  mkdirSync(uploadsDir, { recursive: true })
-  app.use('/uploads', serveStatic(uploadsDir))
+  const publicUploadsDir = join(process.cwd(), 'uploads', 'public')
+  mkdirSync(publicUploadsDir, { recursive: true })
+  app.use('/uploads', serveStatic(publicUploadsDir, {
+    fallthrough: false,
+    setHeaders: (response) => {
+      response.setHeader('X-Content-Type-Options', 'nosniff')
+      response.setHeader('Cache-Control', 'public, max-age=3600')
+    },
+  }))
   app.enableCors({
     origin: (origin: string | undefined, callback: (error: Error | null, allow?: boolean) => void) => {
-      if (!origin || allowedOrigins.size === 0 || allowedOrigins.has(origin) || isAllowedDevOrigin(origin)) {
+      if (!origin || allowedOrigins.has(origin) || isAllowedDevOrigin(origin)) {
         callback(null, true)
         return
       }
 
-      callback(new Error(`Origem CORS nao permitida: ${origin}`))
+      corsLogger.warn(`Origem CORS bloqueada: ${origin.slice(0, 200)}`)
+      callback(new Error('Origem CORS nao permitida.'))
     },
     credentials: true,
     exposedHeaders: ['Content-Disposition'],
   })
   app.setGlobalPrefix('api')
 
-  const swagger = new DocumentBuilder()
-    .setTitle('LiEnsina API')
-    .setDescription('API escolar para escolas, turmas, alunos, simulados, cargos e dashboard.')
-    .setVersion('0.1.0')
-    .addBearerAuth()
-    .build()
-  SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, swagger))
+  if (config.get<string>('SWAGGER_ENABLED') === 'true' || process.env.NODE_ENV !== 'production') {
+    const swaggerUser = config.get<string>('SWAGGER_BASIC_USER')
+    const swaggerPassword = config.get<string>('SWAGGER_BASIC_PASSWORD')
+    if (process.env.NODE_ENV === 'production') {
+      app.use('/docs', (request: Request, response: Response, next: NextFunction) => {
+        const authorization = request.headers.authorization ?? ''
+        const [scheme, token] = authorization.split(' ')
+        const credentials = token ? Buffer.from(token, 'base64').toString('utf8') : ''
+        const [user, password] = credentials.split(':')
+        if (scheme === 'Basic' && user === swaggerUser && password === swaggerPassword) return next()
+        response.setHeader('WWW-Authenticate', 'Basic realm="LiEnsina API Docs"')
+        return response.status(401).send('Swagger protegido.')
+      })
+    }
+
+    const swagger = new DocumentBuilder()
+      .setTitle('LiEnsina API')
+      .setDescription('API escolar para escolas, turmas, alunos, simulados, cargos e dashboard.')
+      .setVersion('0.1.0')
+      .addBearerAuth()
+      .build()
+    SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, swagger))
+  }
 
   const host = config.get<string>('HOST') ?? '0.0.0.0'
   const port = Number(config.get<string>('PORT') ?? 3000)

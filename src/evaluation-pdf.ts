@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { createWriteStream, existsSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
 
-import type { ClassRoom, Evaluation, Question } from './liensina.types'
+import type { ClassRoom, Evaluation, EvaluationAnswerCard, Question, Student } from './liensina.types'
 
 type PrintableImage = {
   source: string
@@ -42,6 +42,11 @@ export type EvaluationPdfInput = {
   classRoom?: ClassRoom
   questions: Question[]
   uploadsRoot: string
+}
+
+export type EvaluationAnswerCardsPdfInput = EvaluationPdfInput & {
+  answerCards: EvaluationAnswerCard[]
+  students?: Student[]
 }
 
 const markdownImagePattern = /!\[([^\]]*)\]\(((?:https?:\/\/|data:image\/)[^\s)]+)\)/gi
@@ -583,17 +588,28 @@ function getEvaluationVersionId(evaluation: Evaluation) {
   return `${evaluation.id}:v-${hash}`
 }
 
-async function createAnswerCardQrBuffer(input: EvaluationPdfInput) {
+async function createAnswerCardQrBuffer(input: EvaluationPdfInput, card?: EvaluationAnswerCard) {
   const versionId = getEvaluationVersionId(input.evaluation)
-  const payload = {
-    examId: input.evaluation.id,
-    versionId,
-    answerCardId: `${input.evaluation.id}:${versionId}`,
+  const payload = card?.qrPayload || {
+    cartao_id: card?.cardId ?? `${input.evaluation.id}:${versionId}`,
+    escola_id: card?.schoolId ?? input.evaluation.schoolId,
+    turma_id: card?.classId ?? input.evaluation.classId,
+    materia_id: card?.subject ?? input.evaluation.subject,
+    prova_id: card?.evaluationId ?? input.evaluation.id,
+    aluno_id: card?.studentId,
+    aluno_nome: card?.studentName,
+    professor_id: card?.teacherId ?? input.evaluation.teacherId,
+    versao_cartao: omrTemplateVersion,
     templateVersion: omrTemplateVersion,
+    answerCardId: card?.cardId ?? `${input.evaluation.id}:${versionId}`,
+    examId: input.evaluation.id,
+    classId: input.evaluation.classId,
+    studentId: card?.studentId,
+    versionId,
     questionCount: input.questions.length,
   }
 
-  return QRCode.toBuffer(JSON.stringify(payload), {
+  return QRCode.toBuffer(typeof payload === 'string' ? payload : JSON.stringify(payload), {
     type: 'png',
     errorCorrectionLevel: 'M',
     margin: 1,
@@ -634,14 +650,31 @@ function getOmrGridLayout(totalQuestions: number) {
   }
 }
 
-function addOmrAnswerCard(doc: PDFKit.PDFDocument, input: EvaluationPdfInput, qrBuffer: Buffer) {
+function addOmrAnswerCard(
+  doc: PDFKit.PDFDocument,
+  input: EvaluationPdfInput,
+  qrBuffer: Buffer,
+  card?: EvaluationAnswerCard,
+  student?: Student,
+) {
   const totalQuestions = input.questions.length
-  const availableHeight = doc.page.height - doc.y - doc.page.margins.bottom
-  const maxWidthByHeight = Math.max(300, availableHeight * (omrCanonicalWidth / omrCanonicalHeight))
-  const cardWidth = Math.min(getPageContentWidth(doc), maxWidthByHeight)
-  const cardHeight = cardWidth * (omrCanonicalHeight / omrCanonicalWidth)
+  const getCardMetrics = () => {
+    const availableHeight = doc.page.height - doc.y - doc.page.margins.bottom
+    const drawableHeight = Math.max(300, availableHeight - 16)
+    const maxWidthByHeight = drawableHeight * (omrCanonicalWidth / omrCanonicalHeight)
+    const cardWidth = Math.min(getPageContentWidth(doc), maxWidthByHeight)
+    const cardHeight = cardWidth * (omrCanonicalHeight / omrCanonicalWidth)
 
-  if (availableHeight < cardHeight + 20) doc.addPage()
+    return { availableHeight, cardWidth, cardHeight }
+  }
+
+  let { availableHeight, cardWidth, cardHeight } = getCardMetrics()
+
+  if (availableHeight < cardHeight + 16) {
+    doc.addPage()
+    doc.y = doc.page.margins.top
+    ;({ availableHeight, cardWidth, cardHeight } = getCardMetrics())
+  }
 
   const x = doc.page.margins.left + (getPageContentWidth(doc) - cardWidth) / 2
   const y = doc.y
@@ -669,10 +702,17 @@ function addOmrAnswerCard(doc: PDFKit.PDFDocument, input: EvaluationPdfInput, qr
 
   doc.font('Helvetica-Bold').fontSize(12).fillColor('#111827').text('CARTAO RESPOSTA', px(120), py(72), { width: sw(560) })
   doc.font('Helvetica').fontSize(8).fillColor('#111827')
-  doc.text(`Prova: ${cleanText(input.evaluation.title)}`, px(120), py(112), { width: sw(560), ellipsis: true })
-  doc.text(`Turma: ${cleanText(input.classRoom?.name ?? 'Turma nao encontrada')}`, px(120), py(146), { width: sw(560), ellipsis: true })
-  doc.text(`Questoes: ${totalQuestions}`, px(120), py(180), { width: sw(180) })
-  doc.text(`Versao: ${getEvaluationVersionId(input.evaluation)}`, px(120), py(214), { width: sw(560), ellipsis: true })
+  doc.text(`Prova: ${cleanText(input.evaluation.title)}`, px(120), py(108), { width: sw(560), ellipsis: true })
+  doc.text(`Turma: ${cleanText(input.classRoom?.name ?? 'Turma nao encontrada')}`, px(120), py(140), { width: sw(560), ellipsis: true })
+  if (card) {
+    doc.text(`Aluno: ${cleanText(card.studentName || student?.name || 'Aluno nao identificado')}`, px(120), py(172), { width: sw(560), ellipsis: true })
+    doc.text(`Cartao: ${cleanText(card.cardId || card.id)}`, px(120), py(204), { width: sw(560), ellipsis: true })
+    const registration = cleanText(student?.registrationNumber || student?.registration || '')
+    doc.text(`Questoes: ${totalQuestions}${registration ? `  Matricula: ${registration}` : ''}`, px(120), py(236), { width: sw(560), ellipsis: true })
+  } else {
+    doc.text(`Questoes: ${totalQuestions}`, px(120), py(180), { width: sw(180) })
+    doc.text(`Versao: ${getEvaluationVersionId(input.evaluation)}`, px(120), py(214), { width: sw(560), ellipsis: true })
+  }
   doc.image(qrBuffer, px(780), py(72), { width: sw(190), height: sh(190) })
   doc.font('Helvetica').fontSize(7).fillColor('#334155').text('Nao dobre, corte ou rasure este cartao.', px(120), py(270), { width: sw(860) })
   doc.moveTo(px(120), py(315)).lineTo(px(980), py(315)).strokeColor('#111827').lineWidth(0.8).stroke()
@@ -755,17 +795,17 @@ function addPageNumbers(doc: PDFKit.PDFDocument) {
     doc.font('Helvetica').fontSize(8).fillColor('#64748b').text(
       `Página ${pageIndex + 1} de ${range.count}`,
       doc.page.margins.left,
-      doc.page.height - doc.page.margins.bottom + 12,
+      doc.page.height - doc.page.margins.bottom - 10,
       {
         align: 'center',
         width: doc.page.width - doc.page.margins.left - doc.page.margins.right,
+        lineBreak: false,
       },
     )
   }
 }
 
 export async function writeEvaluationPdfFile(input: EvaluationPdfInput, filePath: string) {
-  const answerCardQrBuffer = await createAnswerCardQrBuffer(input)
   const stream = createWriteStream(filePath)
   const doc = new PDFDocument({
     size: 'A4',
@@ -786,9 +826,6 @@ export async function writeEvaluationPdfFile(input: EvaluationPdfInput, filePath
 
   doc.pipe(stream)
 
-  addOmrAnswerCard(doc, input, answerCardQrBuffer)
-  doc.addPage()
-
   doc.font('Helvetica-Bold').fontSize(17).fillColor('#111827').text(cleanText(input.evaluation.title).toUpperCase(), {
     align: 'center',
   })
@@ -807,6 +844,121 @@ export async function writeEvaluationPdfFile(input: EvaluationPdfInput, filePath
     addText(doc, 'Esta avaliação está registrada no sistema, mas não possui questões associadas ao banco para impressão.')
   } else {
     input.questions.forEach((question, index) => addQuestion(doc, question, index, input.uploadsRoot))
+  }
+
+  addPageNumbers(doc)
+  doc.end()
+
+  await finished
+}
+
+export async function writeEvaluationAnswerCardsPdfFile(input: EvaluationAnswerCardsPdfInput, filePath: string) {
+  const stream = createWriteStream(filePath)
+  const doc = new PDFDocument({
+    size: 'A4',
+    margin: 42,
+    bufferPages: true,
+    info: {
+      Title: `Cartoes resposta - ${cleanText(input.evaluation.title)}`,
+      Author: 'LiEnsina',
+      Subject: 'Cartoes resposta individualizados',
+    },
+  })
+
+  const finished = new Promise<void>((resolveFinished, rejectFinished) => {
+    stream.on('finish', resolveFinished)
+    stream.on('error', rejectFinished)
+    doc.on('error', rejectFinished)
+  })
+
+  doc.pipe(stream)
+
+  const studentById = new Map((input.students ?? []).map((student) => [student.id, student]))
+  const cards = [...input.answerCards].sort((first, second) => {
+    const firstName = cleanText(first.studentName || studentById.get(first.studentId)?.name)
+    const secondName = cleanText(second.studentName || studentById.get(second.studentId)?.name)
+    return firstName.localeCompare(secondName, 'pt-BR') || first.cardId.localeCompare(second.cardId, 'pt-BR')
+  })
+
+  if (cards.length === 0) {
+    addTitle(doc, 'Cartoes resposta indisponiveis')
+    addText(doc, 'Esta prova ainda nao possui cartoes resposta individualizados gerados para os alunos da turma.')
+  } else {
+    for (const [index, card] of cards.entries()) {
+      if (index > 0) {
+        doc.addPage()
+        doc.y = doc.page.margins.top
+      }
+      const qrBuffer = await createAnswerCardQrBuffer(input, card)
+      addOmrAnswerCard(doc, input, qrBuffer, card, studentById.get(card.studentId))
+    }
+  }
+
+  addPageNumbers(doc)
+  doc.end()
+
+  await finished
+}
+
+function getQuestionCorrectOption(question: Question) {
+  return [...(question.options ?? [])]
+    .sort((first, second) => first.order - second.order)
+    .find((option) => option.isCorrect)?.label
+}
+
+export async function writeEvaluationAnswerKeyPdfFile(input: EvaluationPdfInput, filePath: string) {
+  const stream = createWriteStream(filePath)
+  const doc = new PDFDocument({
+    size: 'A4',
+    margin: 42,
+    bufferPages: true,
+    info: {
+      Title: `Gabarito - ${cleanText(input.evaluation.title)}`,
+      Author: 'LiEnsina',
+      Subject: 'Gabarito da prova',
+    },
+  })
+
+  const finished = new Promise<void>((resolveFinished, rejectFinished) => {
+    stream.on('finish', resolveFinished)
+    stream.on('error', rejectFinished)
+    doc.on('error', rejectFinished)
+  })
+
+  doc.pipe(stream)
+
+  doc.font('Helvetica-Bold').fontSize(17).fillColor('#111827').text(`GABARITO - ${cleanText(input.evaluation.title).toUpperCase()}`, {
+    align: 'center',
+  })
+  doc.moveDown(0.6)
+  doc.font('Helvetica').fontSize(10).fillColor('#111827')
+  doc.text(`Data: ${formatDate(input.evaluation.scheduledAt)}`)
+  doc.text(`Turma: ${cleanText(input.classRoom?.name ?? 'Turma nao encontrada')}`)
+  doc.text(`Disciplina: ${cleanText(input.evaluation.subject)}`)
+  doc.moveDown(0.8)
+
+  if (input.questions.length === 0) {
+    addText(doc, 'Gabarito indisponivel: esta prova nao possui questoes vinculadas.')
+  } else {
+    const columns = 4
+    const columnWidth = getPageContentWidth(doc) / columns
+    const startX = doc.page.margins.left
+    let y = doc.y
+
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#111827')
+    input.questions.forEach((question, index) => {
+      const column = index % columns
+      if (index > 0 && column === 0) y += 22
+      if (y > doc.page.height - doc.page.margins.bottom - 20) {
+        doc.addPage()
+        y = doc.page.margins.top
+      }
+
+      const label = getQuestionCorrectOption(question) ?? '-'
+      doc.text(`${String(index + 1).padStart(2, '0')}. ${label}`, startX + column * columnWidth, y, {
+        width: columnWidth - 8,
+      })
+    })
   }
 
   addPageNumbers(doc)

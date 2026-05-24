@@ -6,6 +6,9 @@ import { AppController } from './app.controller'
 import { AuthGuard } from './auth.guard'
 import { DatabaseService } from './database.service'
 import { LiensinaService } from './liensina.service'
+import { RateLimitService } from './rate-limit.service'
+import { ResourceAccessService } from './resource-access.service'
+import { validateAppEnv } from './env.validation'
 
 function parseDurationSeconds(value: string | undefined, fallback: number) {
   const match = String(value ?? '').trim().match(/^(\d+)(s|m|h|d)?$/i)
@@ -21,14 +24,14 @@ function parseDurationSeconds(value: string | undefined, fallback: number) {
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true }),
+    ConfigModule.forRoot({ isGlobal: true, validate: validateAppEnv }),
     JwtModule.registerAsync({
       global: true,
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_SECRET') ?? 'liensina-local-secret',
+        secret: config.get<string>('JWT_ACCESS_SECRET'),
         signOptions: {
-          expiresIn: parseDurationSeconds(config.get<string>('JWT_ACCESS_EXPIRES_IN'), 30 * 60),
+          expiresIn: parseDurationSeconds(config.get<string>('JWT_ACCESS_EXPIRES_IN'), 15 * 60),
           issuer: config.get<string>('JWT_ISSUER') ?? 'liensina-api',
           audience: config.get<string>('JWT_AUDIENCE') ?? 'liensina-web',
         },
@@ -40,6 +43,6 @@ function parseDurationSeconds(value: string | undefined, fallback: number) {
     }),
   ],
   controllers: [AppController],
-  providers: [DatabaseService, LiensinaService, AuthGuard],
+  providers: [DatabaseService, LiensinaService, AuthGuard, RateLimitService, ResourceAccessService],
 })
 export class AppModule {}

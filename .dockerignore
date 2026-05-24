@@ -2,19 +2,36 @@ node_modules
 dist
 coverage
 *.log
+*.tsbuildinfo
 
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*credentials*
+*credenciais*
+*secret*
 
 data/*.json
-data/*.sqlite
-data/*.sqlite3
 data/backups
-data/*.backup-*
+Backups_LiEnsina
+*.dump
+*.sqlite
+*.sqlite3
+*.sqlite.backup*
+*.bak
+*.sql
+*.backup
+!migrations
+!migrations/*.migration.sql
 uploads
 
 .git
 .gitignore
 Dockerfile
 docker-compose*.yml
+.codex-logs
+.codex-tmp

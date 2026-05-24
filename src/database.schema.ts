@@ -3,6 +3,7 @@ import type { DatabaseShape } from './liensina.types'
 export const databaseCollections: Array<keyof DatabaseShape> = [
   'users',
   'refreshSessions',
+  'idempotencyRecords',
   'notifications',
   'roles',
   'schools',
@@ -11,6 +12,7 @@ export const databaseCollections: Array<keyof DatabaseShape> = [
   'students',
   'classes',
   'evaluations',
+  'answerCards',
   'evaluationCorrections',
   'curriculumBases',
   'curriculumSkills',
@@ -33,6 +35,7 @@ export function createEmptyDatabase(): DatabaseShape {
   return {
     users: [],
     refreshSessions: [],
+    idempotencyRecords: [],
     notifications: [],
     roles: [],
     schools: [],
@@ -41,6 +44,7 @@ export function createEmptyDatabase(): DatabaseShape {
     students: [],
     classes: [],
     evaluations: [],
+    answerCards: [],
     evaluationCorrections: [],
     curriculumBases: [],
     curriculumSkills: [],

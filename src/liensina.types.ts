@@ -4,7 +4,8 @@ export type EvaluationBuildMode = 'automatic_bank' | 'manual_bank' | 'teacher_cr
 export type EvaluationCorrectionStatus = 'SUGGESTED' | 'CONFIRMED' | 'NEEDS_RETAKE' | 'REJECTED'
 export type UserStatus = 'ativo' | 'pendente' | 'bloqueado'
 export type CalendarEventType = 'aula' | 'reuniao' | 'avaliacao' | 'prazo' | 'evento'
-export type RoleCode = 'ADMIN' | 'DIRETOR' | 'COORDENADOR' | 'PROFESSOR' | 'ALUNO' | 'RESPONSAVEL' | 'NUTRITIONIST'
+export type RoleCode = 'SUPERADMIN' | 'ADMIN' | 'ADMIN_ESCOLA' | 'DIRETOR' | 'COORDENADOR' | 'PROFESSOR' | 'ALUNO' | 'RESPONSAVEL' | 'NUTRITIONIST'
+export type IdempotencyStatus = 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
 export type EducationStage = 'INFANTIL' | 'FUNDAMENTAL' | 'MEDIO' | 'EJA'
 export type QuestionType = 'MULTIPLE_CHOICE'
 export type Difficulty = 'EASY' | 'MEDIUM' | 'HARD'
@@ -104,6 +105,7 @@ export interface StoredImageObject {
 export interface RefreshSession {
   id: string
   userId: string
+  jti?: string
   tokenHash: string
   createdAt: string
   expiresAt: string
@@ -111,6 +113,25 @@ export interface RefreshSession {
   rotatedFromId?: string
   userAgent?: string
   ip?: string
+  ipHash?: string
+}
+
+export interface IdempotencyRecord {
+  id: string
+  scopeKey: string
+  key: string
+  actorId: string
+  schoolId: string | null
+  operation: string
+  resourceId: string | null
+  payloadHash: string
+  status: IdempotencyStatus
+  response?: unknown
+  errorMessage?: string | null
+  createdAt: string
+  updatedAt: string
+  expiresAt: string
+  lockedUntil?: string | null
 }
 
 export interface AppNotification {
@@ -202,6 +223,8 @@ export interface ClassRoom {
 export interface Evaluation {
   id: string
   title: string
+  schoolId?: string
+  teacherId?: string
   classId: string
   subject: string
   questions: number
@@ -217,6 +240,8 @@ export interface Evaluation {
   skillCodes?: string[]
   descriptorCodes?: string[]
   sourceSummary?: string
+  omrCardVersion?: string
+  idempotencyKey?: string
   createdById?: string
   createdByName?: string
   createdBy?: {
@@ -224,6 +249,22 @@ export interface Evaluation {
     name?: string
     email?: string
   }
+}
+
+export interface EvaluationAnswerCard {
+  id: string
+  cardId: string
+  schoolId: string
+  classId: string
+  subject: string
+  evaluationId: string
+  studentId: string
+  studentName: string
+  teacherId: string
+  qrPayload: string
+  status: 'GENERATED' | 'PRINTED' | 'USED' | 'CANCELLED'
+  createdAt: string
+  updatedAt: string
 }
 
 export interface EvaluationAnswerKeyItem {
@@ -251,9 +292,13 @@ export interface EvaluationCorrectionDetectedAnswer {
 
 export interface EvaluationCorrection {
   id: string
+  schoolId?: string
   evaluationId: string
   classId: string
   studentId: string
+  studentName?: string
+  cardId?: string | null
+  subject?: string
   status: EvaluationCorrectionStatus
   imageUrl: string | null
   imageObject: StoredImageObject | null
@@ -297,6 +342,7 @@ export interface LessonRecord {
   resources: string
   activity: string
   notes: string
+  attendance?: Record<string, boolean>
 }
 
 export interface RoomReservation {
@@ -500,9 +546,9 @@ export interface QuestionImportPlan {
 
 export interface CreateQuestionRequest {
   title: string
-  context: string
+  context?: string
   statement: string
-  explanation: string
+  explanation?: string
   type: QuestionType
   stage: EducationStage
   gradeLevel: string
@@ -512,16 +558,16 @@ export interface CreateQuestionRequest {
   difficulty: Difficulty
   sourceType: QuestionSourceType
   sourceName: string
-  sourceYear: number | null
-  sourceExternalId: string | null
-  sourceUrl: string | null
-  licenseNotes: string | null
+  sourceYear?: number | null
+  sourceExternalId?: string | null
+  sourceUrl?: string | null
+  licenseNotes?: string | null
   visibility: QuestionVisibility
   options: Array<Pick<QuestionOption, 'label' | 'text' | 'order' | 'isCorrect'>>
   skillIds: string[]
-  descriptorIds: string[]
-  attachments: QuestionAttachment[]
-  metadata: QuestionMetadata
+  descriptorIds?: string[]
+  attachments?: unknown[]
+  metadata?: Partial<QuestionMetadata> & { requestedStatus?: QuestionStatus }
 }
 
 export interface GenerateEnemQuestionsRequest {
@@ -817,6 +863,7 @@ export interface UpsertMealMenuPayload {
 export interface DatabaseShape {
   users: UserAccount[]
   refreshSessions: RefreshSession[]
+  idempotencyRecords: IdempotencyRecord[]
   notifications: AppNotification[]
   roles: Role[]
   schools: School[]
@@ -825,6 +872,7 @@ export interface DatabaseShape {
   students: Student[]
   classes: ClassRoom[]
   evaluations: Evaluation[]
+  answerCards: EvaluationAnswerCard[]
   evaluationCorrections: EvaluationCorrection[]
   curriculumBases: CurriculumBase[]
   curriculumSkills: CurriculumSkill[]
@@ -879,6 +927,7 @@ export interface NotificationsScreenPayload {
 
 export interface JwtPayload {
   sub: string
-  email: string
-  typ: 'access'
+  typ: 'access' | 'refresh'
+  sid?: string
+  jti?: string
 }

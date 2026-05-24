@@ -8,13 +8,18 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "npm run build && node dist/main.js",
     "start:dev": "ts-node-dev --respawn --transpile-only src/main.ts",
-    "db:backup:sqlite": "node scripts/backup-sqlite.mjs",
-    "db:migrate:postgres": "node scripts/migrate-sqlite-to-postgres.mjs",
+    "db:snapshot:local": "node scripts/create-local-snapshot.mjs",
+    "db:migrate:postgres": "node scripts/migrate-local-store-to-postgres.mjs",
     "db:verify:postgres": "node scripts/verify-postgres-migration.mjs",
-    "db:rollback:sqlite": "node scripts/rollback-to-sqlite.mjs",
+    "db:restore:local": "node scripts/restore-local-store.mjs",
     "seed:pedagogy": "node scripts/seed-pedagogical-dashboard.mjs",
     "seed:livia-lessons": "node scripts/seed-livia-lesson-records.mjs",
-    "typecheck": "tsc --noEmit"
+    "security:check-files": "node scripts/check-sensitive-files.mjs",
+    "security:no-dynamic-code": "node scripts/check-dynamic-code.mjs",
+    "security:install-hooks": "git config core.hooksPath .githooks",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test -r ts-node/register src/resource-access.service.test.ts src/security-auth.test.ts",
+    "test:security": "npm run security:no-dynamic-code && node --test -r ts-node/register src/resource-access.service.test.ts src/security-auth.test.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.18",
@@ -29,6 +34,7 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.4",
     "helmet": "^8.1.0",
+    "ioredis": "^5.10.1",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "pdfkit": "^0.18.0",
@@ -36,8 +42,10 @@
     "qrcode": "^1.5.4",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
+    "sharp": "^0.34.5",
     "sql.js": "^1.14.1",
-    "swagger-ui-express": "^5.0.1"
+    "swagger-ui-express": "^5.0.1",
+    "undici": "^7.25.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

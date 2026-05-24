@@ -1,14 +1,18 @@
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common'
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
 import { JwtService } from '@nestjs/jwt'
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { lookup } from 'node:dns/promises'
 import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname, extname, join, resolve, sep } from 'node:path'
+import { isIP } from 'node:net'
+import { dirname, join, resolve, sep } from 'node:path'
 import * as bcrypt from 'bcryptjs'
+import sharp from 'sharp'
 
 import { DatabaseService } from './database.service'
-import { writeEvaluationPdfFile } from './evaluation-pdf'
-import type { AddMealFoodRequestToStockPayload, AppNotification, AssessmentDescriptor, AssessmentMatrix, AssessmentProgram, CalendarEventType, ClassRoom, CreateMealFoodPayload, CreateMealFoodRequestPayload, CreateMealItemPayload, CreateMealManagementPayload, CreateQuestionRequest, DatabaseShape, Difficulty, EducationStage, Evaluation, EvaluationAnswerKeyItem, EvaluationBuildMode, EvaluationCorrection, EvaluationCorrectionDetectedAnswer, EvaluationCorrectionReviewPayload, FoodRequestStatus, GenerateEnemQuestionsRequest, GenerateEnemQuestionsResponse, GenerateQuestionSelectionRequest, GenerateQuestionSelectionResponse, Guardian, JwtPayload, LessonRecord, MealFood, MealFoodRequest, MealManagement, MealMenu, MealMenuStatus, MealRequestHistory, MealRequestHistoryAction, MealShift, MealStockStatus, MealType, MealUnit, NotificationsScreenPayload, PublicUserAccount, Question, QuestionDescriptorSummary, QuestionSourceType, QuestionStatus, QuestionType, QuestionVisibility, RefreshSession, ReviewMealFoodRequestPayload, Role, RoleCode, RoomReservation, School, SchoolCalendarEvent, StoredImageObject, Student, Teacher, UpdateMealBudgetPayload, UpdateMealFoodRequestPayload, UpsertMealMenuPayload, UserAccount } from './liensina.types'
+import { writeEvaluationAnswerCardsPdfFile, writeEvaluationAnswerKeyPdfFile, writeEvaluationPdfFile } from './evaluation-pdf'
+import { EvaluationAnswerCardCreationService, EvaluationQrCodeService } from './evaluation-answer-card.services'
+import type { AddMealFoodRequestToStockPayload, AppNotification, AssessmentDescriptor, AssessmentMatrix, AssessmentProgram, CalendarEventType, ClassRoom, CreateMealFoodPayload, CreateMealFoodRequestPayload, CreateMealItemPayload, CreateMealManagementPayload, CreateQuestionRequest, DatabaseShape, Difficulty, EducationStage, Evaluation, EvaluationAnswerCard, EvaluationAnswerKeyItem, EvaluationBuildMode, EvaluationCorrection, EvaluationCorrectionDetectedAnswer, EvaluationCorrectionReviewPayload, FoodRequestStatus, GenerateEnemQuestionsRequest, GenerateEnemQuestionsResponse, GenerateQuestionSelectionRequest, GenerateQuestionSelectionResponse, Guardian, JwtPayload, LessonRecord, MealFood, MealFoodRequest, MealManagement, MealMenu, MealMenuStatus, MealRequestHistory, MealRequestHistoryAction, MealShift, MealStockStatus, MealType, MealUnit, NotificationsScreenPayload, PublicUserAccount, Question, QuestionDescriptorSummary, QuestionSourceType, QuestionStatus, QuestionType, QuestionVisibility, RefreshSession, ReviewMealFoodRequestPayload, Role, RoleCode, RoomReservation, School, SchoolCalendarEvent, StoredImageObject, Student, Teacher, UpdateMealBudgetPayload, UpdateMealFoodRequestPayload, UpsertMealMenuPayload, UserAccount } from './liensina.types'
 
 type ProfileImageFile = {
   buffer: Buffer
@@ -40,6 +44,18 @@ type OmrServiceResponse = {
   [key: string]: unknown
 }
 
+type OmrBatchIssue = {
+  fileName: string
+  page: number | null
+  reason: string
+}
+
+type OmrResolvedTarget = {
+  student: Student
+  answerCard: EvaluationAnswerCard | null
+  cardId: string | null
+}
+
 export type AuthContext = {
   userAgent?: string
   ip?: string
@@ -47,7 +63,6 @@ export type AuthContext = {
 
 const passwordHashPattern = /^\$2[aby]\$\d{2}\$/
 const passwordSaltRounds = 12
-const defaultRefreshReuseGraceSeconds = 15
 const enemApiBaseUrl = 'https://api.enem.dev/v1/exams'
 const defaultEnemYears = Array.from({ length: 2023 - 2009 + 1 }, (_, index) => 2009 + index)
 const enemQuestionPageLimit = 50
@@ -57,6 +72,13 @@ const enemMarkdownImagePattern = /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/gi
 const forbiddenRolePermissions: Partial<Record<RoleCode, string[]>> = {
   DIRETOR: ['auditoria:ler', 'food.audit.view'],
 }
+const validRoleCodes = new Set<RoleCode>(['SUPERADMIN', 'ADMIN', 'ADMIN_ESCOLA', 'DIRETOR', 'COORDENADOR', 'PROFESSOR', 'ALUNO', 'RESPONSAVEL', 'NUTRITIONIST'])
+const maxProfileImagePixels = 16_000_000
+const maxStoredOmrImagePixels = 24_000_000
+const maxProfileImageDimension = 2048
+const maxStoredOmrImageDimension = 4096
+const maxOmrBatchTotalBytes = 64 * 1024 * 1024
+const maxRemoteQuestionImageBytes = 2 * 1024 * 1024
 
 type EnemDevAlternative = {
   letter?: string
@@ -99,6 +121,14 @@ type EvaluationDownloadFile = {
   filename: string
   contentType: string
 }
+type EvaluationDownloadKind = 'complete' | 'answer_cards' | 'answer_key'
+
+type SafeStoredFile = {
+  buffer: Buffer
+  contentType: string
+  extension: string
+  sizeBytes: number
+}
 
 function parseDurationSeconds(value: string | undefined, fallback: number) {
   const match = String(value ?? '').trim().match(/^(\d+)(s|m|h|d)?$/i)
@@ -115,6 +145,10 @@ function parseDurationSeconds(value: string | undefined, fallback: number) {
 @Injectable()
 export class LiensinaService {
   private readonly calendarEventTypes = new Set<CalendarEventType>(['aula', 'reuniao', 'avaliacao', 'prazo', 'evento'])
+  private readonly answerCardCreationService = new EvaluationAnswerCardCreationService()
+  private readonly qrCodeService = new EvaluationQrCodeService()
+  private omrCircuitOpenUntil = 0
+  private omrFailureCount = 0
 
   constructor(
     private readonly database: DatabaseService,
@@ -122,9 +156,14 @@ export class LiensinaService {
     private readonly configService: ConfigService,
   ) {}
 
+  private readDataForQuery() {
+    const database = this.database as DatabaseService & { readForQuery?: () => DatabaseShape }
+    return typeof database.readForQuery === 'function' ? database.readForQuery() : this.database.read()
+  }
+
   async login(email: string, password: string, context: AuthContext = {}) {
     const normalizedLogin = email.trim().toLowerCase()
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const studentByRegistration = data.students.find((student) => student.registrationNumber.toLowerCase() === normalizedLogin)
     const user = data.users.find((item) =>
       item.email.toLowerCase() === normalizedLogin ||
@@ -138,6 +177,7 @@ export class LiensinaService {
 
     let refreshToken = ''
     let refreshExpiresAt = ''
+    let sessionId = ''
     let publicUser = this.toPublicUserWithResolvedSchool(data, user)
 
     this.database.update((currentData) => {
@@ -150,11 +190,12 @@ export class LiensinaService {
       currentData.refreshSessions.push(refreshSession.session)
       refreshToken = refreshSession.token
       refreshExpiresAt = refreshSession.session.expiresAt
+      sessionId = refreshSession.session.id
       publicUser = this.toPublicUserWithResolvedSchool(currentData, storedUser)
       this.pushAudit(currentData, storedUser.id, 'Login realizado', storedUser.name)
     })
 
-    const accessToken = await this.issueAccessToken(user)
+    const accessToken = await this.issueAccessToken(user, sessionId)
 
     return {
       token: accessToken.token,
@@ -167,36 +208,47 @@ export class LiensinaService {
   }
 
   async refreshLogin(refreshToken: string, context: AuthContext = {}) {
+    const refreshPayload = await this.verifyRefreshToken(refreshToken)
     const tokenHash = this.hashRefreshToken(refreshToken)
     let user: UserAccount | null = null
     let publicUser: PublicUserAccount | null = null
     let nextRefreshToken = ''
     let refreshExpiresAt = ''
+    let nextSessionId = ''
 
     this.database.update((data) => {
       this.removeExpiredRefreshSessions(data)
-      const activeSession = data.refreshSessions.find((item) => item.tokenHash === tokenHash && !item.revokedAt)
-      const recentlyRotatedSession = activeSession
-        ? null
-        : data.refreshSessions.find((item) => item.tokenHash === tokenHash && this.isRecentRefreshReuse(item, context))
-      const session = activeSession ?? recentlyRotatedSession
-      if (!session) throw new UnauthorizedException('Refresh token invalido.')
+      const session = data.refreshSessions.find((item) =>
+        item.tokenHash === tokenHash &&
+        item.userId === refreshPayload.sub &&
+        item.id === refreshPayload.sid &&
+        item.jti === refreshPayload.jti
+      )
+      if (!session) {
+        this.revokeRefreshSessionsForUser(data, refreshPayload.sub)
+        throw new UnauthorizedException('Refresh token invalido ou sessao revogada.')
+      }
+      if (session.revokedAt) {
+        this.revokeRefreshSessionsForUser(data, session.userId)
+        throw new UnauthorizedException('Refresh token revogado ou reutilizado apos rotacao.')
+      }
       if (new Date(session.expiresAt).getTime() <= Date.now()) throw new UnauthorizedException('Refresh token expirado.')
 
       const storedUser = this.ensureCurrentUser(data, session.userId)
       if (storedUser.status !== 'ativo') throw new UnauthorizedException('Usuario bloqueado ou inativo.')
 
-      if (!session.revokedAt) session.revokedAt = new Date().toISOString()
+      session.revokedAt = new Date().toISOString()
       const nextSession = this.createRefreshSession(storedUser.id, context, session.id)
       data.refreshSessions.push(nextSession.session)
       nextRefreshToken = nextSession.token
       refreshExpiresAt = nextSession.session.expiresAt
+      nextSessionId = nextSession.session.id
       user = storedUser
       publicUser = this.toPublicUserWithResolvedSchool(data, storedUser)
     })
 
     if (!user) throw new UnauthorizedException('Usuario nao encontrado.')
-    const accessToken = await this.issueAccessToken(user)
+    const accessToken = await this.issueAccessToken(user, nextSessionId)
 
     return {
       token: accessToken.token,
@@ -222,32 +274,10 @@ export class LiensinaService {
   }
 
   getUserById(userId: string) {
-    const user = this.database.read().users.find((item) => item.id === userId)
+    const user = this.readDataForQuery().users.find((item) => item.id === userId)
     if (!user) throw new UnauthorizedException('Usuario nao encontrado.')
     if (user.status !== 'ativo') throw new UnauthorizedException('Usuario bloqueado ou inativo.')
     return user
-  }
-
-  getBootstrap(userId: string) {
-    const data = this.database.read()
-    const currentUser = this.ensureCurrentUser(data, userId)
-
-    return {
-      currentUser: this.toPublicUserWithResolvedSchool(data, currentUser),
-      dashboard: this.buildDashboard(data),
-      roles: data.roles,
-      users: data.users.map((user) => this.toPublicUserWithResolvedSchool(data, user)),
-      schools: data.schools,
-      teachers: data.teachers,
-      guardians: data.guardians,
-      students: data.students,
-      classes: data.classes,
-      evaluations: data.evaluations,
-      calendarEvents: data.calendarEvents,
-      roomReservations: data.roomReservations,
-      mealManagements: data.mealManagements,
-      auditEvents: data.auditEvents,
-    }
   }
 
   getSession(userId: string) {
@@ -262,33 +292,49 @@ export class LiensinaService {
   }
 
   getDashboardScreen(userId: string, alertPage: string | number = 1, alertLimit: string | number = 10) {
-    const data = this.database.read()
-    this.ensureCurrentUser(data, userId)
+    const data = this.readDataForQuery()
+    const currentUser = this.ensureCurrentUser(data, userId)
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const scopedClassIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+    const scopedEvaluations = data.evaluations.filter((evaluation) => (
+      scopedClassIds.has(evaluation.classId) || this.canAccessEvaluation(data, currentUser, evaluation)
+    ))
+    const dashboardData = {
+      ...data,
+      users: this.getScopedUsers(data, currentUser),
+      schools: scoped.schools,
+      classes: scoped.classes,
+      teachers: scoped.teachers,
+      students: scoped.students,
+      guardians: scoped.guardians,
+      evaluations: scopedEvaluations,
+    }
 
     return {
-      dashboard: this.buildDashboard(data, alertPage, alertLimit),
-      evaluations: data.evaluations,
-      auditEvents: data.auditEvents,
+      dashboard: this.buildDashboard(dashboardData, alertPage, alertLimit),
+      evaluations: scopedEvaluations.map((evaluation) => this.dashboardEvaluationDto(evaluation)),
+      auditEvents: this.getScopedAuditEvents(data, currentUser).slice(0, 25),
     }
   }
 
   getSchoolsScreen(userId: string) {
-    const data = this.database.read()
-    this.ensureCurrentUser(data, userId)
+    const data = this.readDataForQuery()
+    const currentUser = this.ensureCurrentUser(data, userId)
+    const scopedData = this.getScopedDatabaseView(data, currentUser)
 
     return {
-      schools: data.schools,
-      teachers: data.teachers,
-      guardians: data.guardians,
-      students: data.students,
-      classes: data.classes,
-      lessonRecords: data.lessonRecords,
-      roomReservations: data.roomReservations,
+      schools: scopedData.schools,
+      teachers: scopedData.teachers,
+      guardians: scopedData.guardians,
+      students: scopedData.students,
+      classes: scopedData.classes,
+      lessonRecords: scopedData.lessonRecords,
+      roomReservations: scopedData.roomReservations,
     }
   }
 
   listRoomReservations(userId: string) {
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const currentUser = this.ensureCurrentUser(data, userId)
     const scoped = this.getScopedSchoolsData(data, currentUser)
     const schoolIds = new Set(scoped.schools.map((school) => school.id))
@@ -301,7 +347,7 @@ export class LiensinaService {
   }
 
   listLessonRecords(userId: string) {
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const currentUser = this.ensureCurrentUser(data, userId)
     const scoped = this.getScopedSchoolsData(data, currentUser)
     const classIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
@@ -317,7 +363,7 @@ export class LiensinaService {
     schoolId = 'all',
     discipline = 'all',
   ) {
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const currentUser = this.ensureCurrentUser(data, userId)
     const scoped = this.getScopedSchoolsData(data, currentUser)
     const query = this.normalizeTextKey(search)
@@ -350,8 +396,10 @@ export class LiensinaService {
     search = '',
     schoolId = 'all',
     discipline = 'all',
+    _classId = 'all',
+    view = 'default',
   ) {
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const currentUser = this.ensureCurrentUser(data, userId)
     const scoped = this.getScopedSchoolsData(data, currentUser)
     const query = this.normalizeTextKey(search)
@@ -374,8 +422,52 @@ export class LiensinaService {
 
     const page = this.paginate(students, rawPage, rawLimit, 10)
 
+    const studentsPage = String(view) === 'identity'
+      ? page.items.map((student) => ({ id: student.id, name: student.name, schoolId: student.schoolId, classId: student.classId }))
+      : page.items
+
     return {
-      students: page.items,
+      students: studentsPage,
+      pagination: page.pagination,
+    }
+  }
+
+  listTeacherSubjectCardsPage(userId: string, rawPage: string | number = 1, rawLimit: string | number = 6) {
+    const data = this.readDataForQuery()
+    const actor = this.ensureCurrentUser(data, userId)
+    const scoped = this.getScopedSchoolsData(data, actor)
+    const subjects = new Map<string, { subject: string; classes: ClassRoom[] }>()
+    const addSubject = (subject: string, classRoom?: ClassRoom) => {
+      const cleanSubject = String(subject ?? '').trim()
+      if (!cleanSubject) return
+      const key = this.normalizeTextKey(cleanSubject)
+      const current = subjects.get(key) ?? { subject: cleanSubject, classes: [] }
+      if (classRoom && !current.classes.some((item) => item.id === classRoom.id)) current.classes.push(classRoom)
+      subjects.set(key, current)
+    }
+
+    for (const classRoom of scoped.classes) {
+      for (const focus of classRoom.bnccFocus ?? []) addSubject(focus, classRoom)
+      if (!(classRoom.bnccFocus ?? []).length) addSubject(classRoom.grade, classRoom)
+    }
+
+    for (const fallback of ['Matematica', 'Lingua Portuguesa', 'Historia', 'Geografia', 'Ciencias']) addSubject(fallback)
+
+    const cards = Array.from(subjects.values())
+      .sort((first, second) => {
+        const firstLinked = first.classes.length > 0 ? 0 : 1
+        const secondLinked = second.classes.length > 0 ? 0 : 1
+        return firstLinked - secondLinked || first.subject.localeCompare(second.subject)
+      })
+      .map((item) => ({
+        id: this.createStableSubjectId(item.subject),
+        subject: item.subject,
+        classes: item.classes,
+      }))
+    const page = this.paginate(cards, rawPage, rawLimit, 6)
+
+    return {
+      subjectCards: page.items,
       pagination: page.pagination,
     }
   }
@@ -433,7 +525,7 @@ export class LiensinaService {
   }
 
   getEvaluationsScreen(userId: string) {
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const currentUser = this.ensureCurrentUser(data, userId)
     const roleCode = this.getCurrentRoleCode(data, currentUser)
     const scoped = this.getScopedSchoolsData(data, currentUser)
@@ -458,25 +550,26 @@ export class LiensinaService {
   }
 
   getCalendarScreen(userId: string) {
-    const data = this.database.read()
-    this.ensureCurrentUser(data, userId)
+    const data = this.readDataForQuery()
+    const currentUser = this.ensureCurrentUser(data, userId)
+    const scopedData = this.getScopedDatabaseView(data, currentUser)
 
     return {
-      calendarEvents: data.calendarEvents,
-      roomReservations: data.roomReservations,
-      schools: data.schools,
-      classes: data.classes,
-      evaluations: data.evaluations,
+      calendarEvents: scopedData.calendarEvents,
+      roomReservations: scopedData.roomReservations,
+      schools: scopedData.schools,
+      classes: scopedData.classes,
+      evaluations: scopedData.evaluations,
     }
   }
 
   getMealsScreen(userId: string) {
     this.ensureMealManagementDataReady(userId)
 
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const currentUser = this.ensureCurrentUser(data, userId)
     const roleCode = this.getCurrentRoleCode(data, currentUser)
-    const canViewAll = roleCode === 'ADMIN' || roleCode === 'NUTRITIONIST'
+    const canViewAll = this.isSuperAdminRole(roleCode) || roleCode === 'NUTRITIONIST'
     const managements = currentUser.schoolId && !canViewAll
       ? data.mealManagements.filter((management) => management.escolaId === currentUser.schoolId)
       : data.mealManagements
@@ -501,12 +594,12 @@ export class LiensinaService {
   listMealManagementSchoolPage(userId: string, rawPage: string | number = 1, rawLimit: string | number = 5, search = '') {
     this.ensureMealManagementDataReady(userId)
 
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const currentUser = this.ensureCurrentUser(data, userId)
     const page = Math.max(1, Number(rawPage) || 1)
     const limit = Math.min(20, Math.max(1, Number(rawLimit) || 5))
     const roleCode = this.getCurrentRoleCode(data, currentUser)
-    const canViewAll = roleCode === 'ADMIN' || roleCode === 'NUTRITIONIST'
+    const canViewAll = this.isSuperAdminRole(roleCode) || roleCode === 'NUTRITIONIST'
     const query = this.normalizeTextKey(search)
     const managementBySchoolId = new Map<string, MealManagement>()
     for (const management of data.mealManagements) {
@@ -539,7 +632,7 @@ export class LiensinaService {
   }
 
   searchMealFoods(userId: string, search: string, rawLimit: string | number = 5) {
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     this.ensureCurrentUser(data, userId)
 
     const query = this.normalizeMealFoodSearch(search)
@@ -947,7 +1040,7 @@ export class LiensinaService {
   }
 
   getAccessScreen(userId: string) {
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     this.ensureCurrentUser(data, userId)
 
     return {
@@ -958,7 +1051,7 @@ export class LiensinaService {
   }
 
   searchAccessUsers(userId: string, search = '', schoolId = 'all', kind = 'all', rawLimit: string | number = 10) {
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     this.ensureRole(data, userId, 'ADMIN')
 
     const query = this.normalizeTextKey(search)
@@ -1031,7 +1124,7 @@ export class LiensinaService {
   }
 
   getSettingsScreen(userId: string) {
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const currentUser = this.ensureCurrentUser(data, userId)
     const scoped = this.getScopedSchoolsData(data, currentUser)
     const currentUserPayload = this.toPublicUserWithResolvedSchool(data, currentUser)
@@ -1050,6 +1143,7 @@ export class LiensinaService {
 
   createSchool(actorId: string, payload: Partial<School>) {
     this.ensureRequired(payload, ['name', 'city', 'address', 'director', 'inepCode'])
+    this.rejectControlledFields(payload, ['id'])
     const school: School = {
       id: this.createId('esc'),
       name: payload.name!.trim(),
@@ -1060,6 +1154,7 @@ export class LiensinaService {
       active: payload.active ?? true,
     }
     this.database.update((data) => {
+      this.ensureGlobalAdmin(data, actorId)
       data.schools.unshift(school)
       this.createMissingMealManagements(data, this.getCurrentReferenceMonth(), actorId)
       this.pushAudit(data, actorId, 'Criou escola', school.name)
@@ -1068,11 +1163,23 @@ export class LiensinaService {
   }
 
   updateSchool(actorId: string, id: string, payload: Partial<School>) {
+    this.rejectControlledFields(payload, ['id'])
     let updated: School | null = null
     this.database.update((data) => {
+      this.ensureGlobalAdmin(data, actorId)
       const index = data.schools.findIndex((school) => school.id === id)
       if (index < 0) throw new NotFoundException('Escola nao encontrada.')
-      updated = { ...data.schools[index], ...payload, id }
+      const current = data.schools[index]
+      updated = {
+        ...current,
+        name: payload.name === undefined ? current.name : String(payload.name).trim(),
+        city: payload.city === undefined ? current.city : String(payload.city).trim(),
+        address: payload.address === undefined ? current.address : String(payload.address).trim(),
+        director: payload.director === undefined ? current.director : String(payload.director).trim(),
+        inepCode: payload.inepCode === undefined ? current.inepCode : String(payload.inepCode).trim(),
+        active: payload.active === undefined ? current.active : Boolean(payload.active),
+        id,
+      }
       data.schools[index] = updated
       this.pushAudit(data, actorId, 'Atualizou escola', updated.name)
     })
@@ -1081,6 +1188,7 @@ export class LiensinaService {
 
   createClassRoom(actorId: string, payload: Partial<ClassRoom>) {
     this.ensureRequired(payload, ['name', 'grade', 'schoolId', 'teacherId', 'schedule'])
+    this.rejectControlledFields(payload, ['id'])
     const teacherIds = Array.from(new Set([payload.teacherId!, ...(payload.teacherIds ?? [])].filter(Boolean)))
     const classRoom: ClassRoom = {
       id: this.createId('turma'),
@@ -1095,6 +1203,7 @@ export class LiensinaService {
       bnccFocus: payload.bnccFocus ?? [],
     }
     this.database.update((data) => {
+      this.ensureStudentMutationAllowed(data, actorId, classRoom.schoolId)
       if (!data.schools.some((school) => school.id === classRoom.schoolId)) throw new BadRequestException('Escola informada nao existe.')
       if (!teacherIds.every((teacherId) => data.teachers.some((teacher) => teacher.id === teacherId && teacher.schoolId === classRoom.schoolId))) {
         throw new BadRequestException('Todos os professores da turma precisam pertencer a escola selecionada.')
@@ -1106,20 +1215,33 @@ export class LiensinaService {
   }
 
   updateClassRoom(actorId: string, id: string, payload: Partial<ClassRoom>) {
+    this.rejectControlledFields(payload, ['id'])
     let updated: ClassRoom | null = null
     this.database.update((data) => {
       const index = data.classes.findIndex((classRoom) => classRoom.id === id)
       if (index < 0) throw new NotFoundException('Turma nao encontrada.')
-      const teacherId = payload.teacherId ?? data.classes[index].teacherId
-      const teacherIds = Array.from(new Set([teacherId, ...(payload.teacherIds ?? data.classes[index].teacherIds ?? [])].filter(Boolean)))
-      const schoolId = payload.schoolId ?? data.classes[index].schoolId
+      const current = data.classes[index]
+      const teacherId = payload.teacherId ?? current.teacherId
+      const teacherIds = Array.from(new Set([teacherId, ...(payload.teacherIds ?? current.teacherIds ?? [])].filter(Boolean)))
+      const schoolId = payload.schoolId ?? current.schoolId
+      this.ensureStudentMutationAllowed(data, actorId, current.schoolId)
+      if (schoolId !== current.schoolId) this.ensureStudentMutationAllowed(data, actorId, schoolId)
       if (!teacherIds.every((item) => data.teachers.some((teacher) => teacher.id === item && teacher.schoolId === schoolId))) {
         throw new BadRequestException('Todos os professores da turma precisam pertencer a escola selecionada.')
       }
-      const normalizedPayload = payload.grade === undefined
-        ? payload
-        : { ...payload, grade: this.normalizeClassGrade(payload.grade) }
-      updated = { ...data.classes[index], ...normalizedPayload, id, teacherId, teacherIds }
+      updated = {
+        ...current,
+        id,
+        name: payload.name === undefined ? current.name : String(payload.name).trim(),
+        grade: payload.grade === undefined ? current.grade : this.normalizeClassGrade(payload.grade),
+        shift: payload.shift ?? current.shift,
+        schoolId,
+        teacherId,
+        teacherIds,
+        academicYear: payload.academicYear === undefined ? current.academicYear : Number(payload.academicYear),
+        schedule: payload.schedule === undefined ? current.schedule : String(payload.schedule).trim(),
+        bnccFocus: Array.isArray(payload.bnccFocus) ? payload.bnccFocus.map(String).slice(0, 20) : current.bnccFocus,
+      }
       data.classes[index] = updated
       this.pushAudit(data, actorId, 'Atualizou turma', updated.name)
     })
@@ -1128,6 +1250,7 @@ export class LiensinaService {
 
   createTeacher(actorId: string, payload: Partial<Teacher> & { classId?: string; password?: string; phone?: string }) {
     this.ensureRequired(payload, ['name', 'email', 'schoolId', 'specialty', 'password'])
+    this.rejectControlledFields(payload, ['id', 'userId', 'avatarUrl', 'bannerUrl', 'avatarObject', 'bannerObject'])
     const teacherId = randomUUID()
     const userId = randomUUID()
     const teacher: Teacher = {
@@ -1141,6 +1264,7 @@ export class LiensinaService {
     }
 
     this.database.update((data) => {
+      this.ensureStudentMutationAllowed(data, actorId, teacher.schoolId)
       this.ensureSchoolExists(data, teacher.schoolId)
       if (data.teachers.some((item) => item.email.toLowerCase() === teacher.email)) throw new BadRequestException('Ja existe professor com este e-mail.')
       if (data.users.some((item) => item.email.toLowerCase() === teacher.email)) throw new BadRequestException('Ja existe usuario com este e-mail.')
@@ -1172,15 +1296,27 @@ export class LiensinaService {
   }
 
   updateTeacher(actorId: string, id: string, payload: Partial<Teacher> & { classId?: string }) {
+    this.rejectControlledFields(payload, ['id', 'userId', 'avatarUrl', 'bannerUrl', 'avatarObject', 'bannerObject'])
     let updated: Teacher | null = null
 
     this.database.update((data) => {
       const index = data.teachers.findIndex((teacher) => teacher.id === id)
       if (index < 0) throw new NotFoundException('Professor nao encontrado.')
 
-      const schoolId = payload.schoolId ?? data.teachers[index].schoolId
+      const current = data.teachers[index]
+      const schoolId = payload.schoolId ?? current.schoolId
+      this.ensureStudentMutationAllowed(data, actorId, current.schoolId)
+      if (schoolId !== current.schoolId) this.ensureStudentMutationAllowed(data, actorId, schoolId)
       this.ensureSchoolExists(data, schoolId)
-      updated = { ...data.teachers[index], ...payload, id, schoolId, email: (payload.email ?? data.teachers[index].email).trim().toLowerCase() }
+      updated = {
+        ...current,
+        id,
+        name: payload.name === undefined ? current.name : String(payload.name).trim(),
+        email: (payload.email ?? current.email).trim().toLowerCase(),
+        schoolId,
+        specialty: payload.specialty === undefined ? current.specialty : String(payload.specialty).trim(),
+        active: payload.active === undefined ? current.active : Boolean(payload.active),
+      }
       data.teachers[index] = updated
 
       const userIndex = data.users.findIndex((user) => user.id === updated!.userId)
@@ -1209,11 +1345,13 @@ export class LiensinaService {
 
   createStudent(actorId: string, payload: Partial<Student> & { password?: string }) {
     this.ensureRequired(payload, ['name', 'schoolId', 'classId', 'password'])
+    this.rejectControlledFields(payload, ['id', 'userId', 'role', 'registration', 'registrationNumber', 'login', 'status', 'attendanceRate', 'averageScore', 'desempenho', 'createdById'])
     const studentId = randomUUID()
     const userId = randomUUID()
     let student: Student | null = null
 
     this.database.update((data) => {
+      this.ensureStudentMutationAllowed(data, actorId, String(payload.schoolId ?? ''))
       const school = this.ensureSchoolExists(data, payload.schoolId!)
       this.getClassRoomForSchool(data.classes, payload.classId!, school.id)
       const registrationNumber = this.buildRegistrationNumber(data, payload.registrationNumber ?? payload.registration)
@@ -1238,10 +1376,10 @@ export class LiensinaService {
         schoolId: school.id,
         classId: payload.classId!,
         guardianIds: payload.guardianIds ?? [],
-        status: payload.status ?? 'matriculado',
-        attendanceRate: payload.attendanceRate ?? 100,
-        averageScore: payload.averageScore ?? 0,
-        desempenho: payload.desempenho ?? 'Otimo',
+        status: 'matriculado',
+        attendanceRate: 100,
+        averageScore: 0,
+        desempenho: 'Otimo',
       }
 
       this.ensureGuardiansBelongToSchool(data, student.guardianIds, school.id)
@@ -1271,20 +1409,32 @@ export class LiensinaService {
   }
 
   updateStudent(actorId: string, id: string, payload: Partial<Student>) {
+    this.rejectControlledFields(payload, ['id', 'userId', 'role', 'registration', 'registrationNumber', 'login', 'attendanceRate', 'averageScore', 'desempenho', 'avatarUrl', 'bannerUrl', 'avatarObject', 'bannerObject'])
     let updated: Student | null = null
 
     this.database.update((data) => {
       const index = data.students.findIndex((student) => student.id === id)
       if (index < 0) throw new NotFoundException('Aluno nao encontrado.')
 
-      const schoolId = payload.schoolId ?? data.students[index].schoolId
+      const current = data.students[index]
+      const schoolId = payload.schoolId ?? current.schoolId
+      this.ensureStudentMutationAllowed(data, actorId, current.schoolId)
+      if (schoolId !== current.schoolId) this.ensureStudentMutationAllowed(data, actorId, schoolId)
       this.ensureSchoolExists(data, schoolId)
-      const classId = payload.classId ?? data.students[index].classId
+      const classId = payload.classId ?? current.classId
       this.getClassRoomForSchool(data.classes, classId, schoolId)
-      const guardianIds = payload.guardianIds ?? data.students[index].guardianIds
+      const guardianIds = payload.guardianIds ?? current.guardianIds
       this.ensureGuardiansBelongToSchool(data, guardianIds, schoolId)
 
-      updated = { ...data.students[index], ...payload, id, schoolId, classId, guardianIds }
+      updated = {
+        ...current,
+        id,
+        name: payload.name === undefined ? current.name : String(payload.name).trim(),
+        schoolId,
+        classId,
+        guardianIds,
+        status: payload.status ?? current.status,
+      }
       data.students[index] = updated
 
       for (const guardian of data.guardians) {
@@ -1311,12 +1461,14 @@ export class LiensinaService {
 
   createGuardian(actorId: string, payload: Partial<Guardian> & { password?: string }) {
     this.ensureRequired(payload, ['name', 'email', 'schoolId', 'password'])
+    this.rejectControlledFields(payload, ['id', 'userId', 'role', 'avatarUrl', 'bannerUrl', 'avatarObject', 'bannerObject'])
     const guardianId = randomUUID()
     const userId = randomUUID()
     const studentIds = payload.studentIds ?? []
     let guardian: Guardian | null = null
 
     this.database.update((data) => {
+      this.ensureStudentMutationAllowed(data, actorId, payload.schoolId!)
       this.ensureSchoolExists(data, payload.schoolId!)
       this.ensureStudentsBelongToSchool(data, studentIds, payload.schoolId!)
       const email = payload.email!.trim().toLowerCase()
@@ -1361,25 +1513,30 @@ export class LiensinaService {
   }
 
   updateGuardian(actorId: string, id: string, payload: Partial<Guardian>) {
+    this.rejectControlledFields(payload, ['id', 'userId', 'role', 'avatarUrl', 'bannerUrl', 'avatarObject', 'bannerObject'])
     let updated: Guardian | null = null
 
     this.database.update((data) => {
       const index = data.guardians.findIndex((guardian) => guardian.id === id)
       if (index < 0) throw new NotFoundException('Responsavel nao encontrado.')
 
-      const schoolId = payload.schoolId ?? data.guardians[index].schoolId
-      const studentIds = payload.studentIds ?? data.guardians[index].studentIds
+      const current = data.guardians[index]
+      const schoolId = payload.schoolId ?? current.schoolId
+      const studentIds = payload.studentIds ?? current.studentIds
+      this.ensureStudentMutationAllowed(data, actorId, current.schoolId)
+      if (schoolId !== current.schoolId) this.ensureStudentMutationAllowed(data, actorId, schoolId)
       this.ensureSchoolExists(data, schoolId)
       this.ensureStudentsBelongToSchool(data, studentIds, schoolId)
 
       updated = {
-        ...data.guardians[index],
-        ...payload,
+        ...current,
         id,
+        name: payload.name === undefined ? current.name : String(payload.name).trim(),
         schoolId,
+        phone: payload.phone === undefined ? current.phone : String(payload.phone).trim(),
         studentIds,
         role: 'RESPONSAVEL',
-        email: (payload.email ?? data.guardians[index].email).trim().toLowerCase(),
+        email: (payload.email ?? current.email).trim().toLowerCase(),
       }
       data.guardians[index] = updated
 
@@ -1407,57 +1564,96 @@ export class LiensinaService {
     return updated!
   }
 
-  createEvaluation(actorId: string, payload: Partial<Evaluation>) {
+  async createEvaluation(actorId: string, payload: Partial<Evaluation>, idempotencyKey?: string) {
     this.ensureRequired(payload, ['title', 'classId', 'subject', 'scheduledAt'])
-    let evaluation: Evaluation | null = null
+    this.rejectControlledFields(payload, ['id', 'schoolId', 'teacherId', 'status', 'corrected', 'participants', 'averageScore', 'createdById', 'createdByName', 'createdBy', 'idempotencyKey'])
+    const operation = async () => {
+      let evaluation: Evaluation | null = null
+      let answerCards: EvaluationAnswerCard[] = []
 
-    this.database.update((data) => {
-      const actor = this.ensureCurrentUser(data, actorId)
-      const questionIds = Array.isArray(payload.questionIds) ? payload.questionIds : []
-      this.ensureQuestionIdsExist(data, questionIds)
-      const payloadSnapshots = Array.isArray(payload.questionSnapshots) ? payload.questionSnapshots : []
-      const questionSnapshots = questionIds
-        .map((questionId) => data.questions.find((question) => question.id === questionId) ?? payloadSnapshots.find((question) => question.id === questionId))
-        .filter((question): question is Question => Boolean(question))
+      await this.database.updateCommitted((data) => {
+        const actor = this.ensureCurrentUser(data, actorId)
+        const roleCode = this.getCurrentRoleCode(data, actor)
+        if (!this.canCreateEvaluationRole(roleCode)) throw new ForbiddenException('Seu perfil nao pode criar provas.')
+        const classRoom = data.classes.find((item) => item.id === payload.classId)
+        if (!classRoom) throw new BadRequestException('Turma informada nao existe.')
+        if (!this.canAccessClassForMutation(data, actor, classRoom)) throw new ForbiddenException('Seu perfil nao tem permissao para criar provas nesta turma.')
+        if (roleCode === 'PROFESSOR' && !this.classSubjectMatchesTeacher(data, actor, classRoom, payload.subject)) {
+          throw new ForbiddenException('Professor nao vinculado a turma/disciplina informada.')
+        }
+        const questionIds = Array.isArray(payload.questionIds) ? payload.questionIds : []
+        this.ensureQuestionIdsExist(data, questionIds)
+        const payloadSnapshots = Array.isArray(payload.questionSnapshots) ? payload.questionSnapshots : []
+        const questionSnapshots = questionIds
+          .map((questionId) => data.questions.find((question) => question.id === questionId) ?? payloadSnapshots.find((question) => question.id === questionId))
+          .filter((question): question is Question => Boolean(question))
 
-      evaluation = {
-        id: this.createId('sim'),
-        title: payload.title!.trim(),
-        classId: payload.classId!,
-        subject: payload.subject!.trim(),
-        questions: payload.questions ?? 20,
-        scheduledAt: payload.scheduledAt!,
-        status: payload.status ?? 'planejado',
-        corrected: payload.corrected ?? 0,
-        participants: payload.participants ?? 0,
-        averageScore: payload.averageScore ?? 0,
-        triLevel: payload.triLevel ?? 'Aguardando aplicacao',
-        buildMode: payload.buildMode,
-        questionIds,
-        questionSnapshots,
-        skillCodes: Array.isArray(payload.skillCodes) ? payload.skillCodes : [],
-        descriptorCodes: Array.isArray(payload.descriptorCodes) ? payload.descriptorCodes : [],
-        sourceSummary: payload.sourceSummary,
-        createdById: actor.id,
-        createdByName: actor.name,
-        createdBy: {
-          id: actor.id,
-          name: actor.name,
-          email: actor.email,
-        },
+        evaluation = {
+          id: this.createId('sim'),
+          title: payload.title!.trim(),
+          schoolId: classRoom.schoolId,
+          teacherId: actor.linkedTeacherId,
+          classId: payload.classId!,
+          subject: payload.subject!.trim(),
+          questions: payload.questions ?? 20,
+          scheduledAt: payload.scheduledAt!,
+          status: 'planejado',
+          corrected: 0,
+          participants: 0,
+          averageScore: 0,
+          triLevel: payload.triLevel ?? 'Aguardando aplicacao',
+          buildMode: payload.buildMode,
+          questionIds,
+          questionSnapshots,
+          skillCodes: Array.isArray(payload.skillCodes) ? payload.skillCodes : [],
+          descriptorCodes: Array.isArray(payload.descriptorCodes) ? payload.descriptorCodes : [],
+          sourceSummary: payload.sourceSummary,
+          createdById: actor.id,
+          createdByName: actor.name,
+          createdBy: {
+            id: actor.id,
+            name: actor.name,
+            email: actor.email,
+          },
+        }
+        const classStudents = data.students.filter((student) => (
+          student.classId === classRoom.id
+          && student.schoolId === classRoom.schoolId
+          && student.status !== 'inativo'
+        ))
+        const now = new Date().toISOString()
+        answerCards = this.answerCardCreationService.createCards({
+          evaluation,
+          classRoom,
+          students: classStudents,
+          teacherId: actor.linkedTeacherId ?? actor.id,
+          now,
+          createId: (prefix) => this.createId(prefix),
+        })
+
+        data.evaluations.unshift(evaluation)
+        data.answerCards.unshift(...answerCards)
+        this.pushAudit(data, actorId, 'Criou prova', `${evaluation.title} (${answerCards.length} cartoes)`)
+      })
+      const inlineLimit = this.getEvaluationCreateInlineCardsLimit()
+      const responseEvaluation = { ...evaluation!, answerCardsCount: answerCards.length } as Evaluation & { answerCardsCount: number }
+      return {
+        evaluation: responseEvaluation,
+        answerCards: answerCards.length <= inlineLimit ? answerCards : [],
       }
-      data.evaluations.unshift(evaluation)
-      this.pushAudit(data, actorId, 'Criou prova', evaluation.title)
-    })
-    return evaluation!
+    }
+
+    const schoolId = this.readDataForQuery().classes.find((item) => item.id === payload.classId)?.schoolId ?? null
+    return this.runIdempotentOperation(actorId, schoolId, 'evaluation.create', String(payload.classId), payload, idempotencyKey, operation)
   }
 
-  async getEvaluationDownload(actorId: string, id: string): Promise<EvaluationDownloadFile> {
-    const data = this.database.read()
+  async getEvaluationDownload(actorId: string, id: string, kind = 'complete'): Promise<EvaluationDownloadFile> {
+    let data = this.readDataForQuery()
+    const downloadKind = this.normalizeEvaluationDownloadKind(kind)
     const actor = this.ensureCurrentUser(data, actorId)
     const roleCode = this.getCurrentRoleCode(data, actor)
-    if (!['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) {
-      throw new ForbiddenException('Seu perfil nao pode baixar provas.')
+    if (!['SUPERADMIN', 'ADMIN', 'ADMIN_ESCOLA', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) {
+      throw new ForbiddenException('Seu perfil nao pode baixar arquivos de provas.')
     }
 
     let evaluation = data.evaluations.find((item) => item.id === id)
@@ -1469,7 +1665,7 @@ export class LiensinaService {
     let questions = this.resolveEvaluationQuestions(data, evaluation)
 
     if (!questions.length && Number(evaluation.questions) > 0) {
-      const updatedData = this.database.update((current) => {
+      data = this.database.update((current) => {
         const currentActor = this.ensureCurrentUser(current, actorId)
         const currentEvaluationIndex = current.evaluations.findIndex((item) => item.id === id)
         if (currentEvaluationIndex < 0) throw new NotFoundException('Prova nao encontrada.')
@@ -1488,20 +1684,39 @@ export class LiensinaService {
         this.pushAudit(current, actorId, 'Vinculou questoes a prova legada', currentEvaluation.title)
       })
 
-      evaluation = updatedData.evaluations.find((item) => item.id === id) ?? evaluation
-      questions = this.resolveEvaluationQuestions(updatedData, evaluation)
+      evaluation = data.evaluations.find((item) => item.id === id) ?? evaluation
+      questions = this.resolveEvaluationQuestions(data, evaluation)
+    }
+
+    if (downloadKind === 'answer_cards') {
+      data = this.ensureEvaluationAnswerCards(actorId, evaluation.id)
+      evaluation = data.evaluations.find((item) => item.id === id) ?? evaluation
+      questions = this.resolveEvaluationQuestions(data, evaluation)
     }
 
     const classRoom = data.classes.find((item) => item.id === evaluation.classId)
-    const uploadsRoot = resolve(process.cwd(), 'uploads')
+    const uploadsRoot = resolve(process.cwd(), 'uploads', 'public')
     const exportsDir = join(uploadsRoot, 'evaluations')
     mkdirSync(exportsDir, { recursive: true })
 
-    const filename = `${this.safeDownloadSlug(evaluation.title || 'prova')}-${evaluation.id}.pdf`
+    const filenamePrefix = downloadKind === 'answer_cards'
+      ? 'cartoes-resposta'
+      : downloadKind === 'answer_key'
+        ? 'gabarito'
+        : 'prova'
+    const filename = `${filenamePrefix}-${this.safeDownloadSlug(evaluation.title || filenamePrefix)}-${evaluation.id}.pdf`
     const filePath = join(exportsDir, filename)
     const tempPath = join(exportsDir, `.${filename}.${randomUUID()}.tmp`)
 
-    await writeEvaluationPdfFile({ evaluation, classRoom, questions, uploadsRoot }, tempPath)
+    if (downloadKind === 'answer_cards') {
+      const answerCards = data.answerCards.filter((card) => card.evaluationId === evaluation.id)
+      const students = data.students.filter((student) => student.classId === evaluation.classId)
+      await writeEvaluationAnswerCardsPdfFile({ evaluation, classRoom, questions, uploadsRoot, answerCards, students }, tempPath)
+    } else if (downloadKind === 'answer_key') {
+      await writeEvaluationAnswerKeyPdfFile({ evaluation, classRoom, questions, uploadsRoot }, tempPath)
+    } else {
+      await writeEvaluationPdfFile({ evaluation, classRoom, questions, uploadsRoot }, tempPath)
+    }
     renameSync(tempPath, filePath)
 
     return {
@@ -1511,10 +1726,88 @@ export class LiensinaService {
     }
   }
 
+  private normalizeEvaluationDownloadKind(kind: string): EvaluationDownloadKind {
+    const normalized = String(kind ?? 'complete').trim().toLowerCase().replace(/-/g, '_')
+    if (normalized === 'complete' || normalized === 'prova' || normalized === 'evaluation') return 'complete'
+    if (normalized === 'answer_cards' || normalized === 'cartoes' || normalized === 'cartoes_resposta') return 'answer_cards'
+    if (normalized === 'answer_key' || normalized === 'gabarito') return 'answer_key'
+    throw new BadRequestException('Tipo de download de prova invalido.')
+  }
+
+  private getEvaluationCreateInlineCardsLimit() {
+    const configured = Number(this.configService.get<string>('EVALUATION_CREATE_INLINE_CARDS_LIMIT') ?? 300)
+    if (!Number.isFinite(configured)) return 300
+    return Math.max(0, Math.min(500, Math.trunc(configured)))
+  }
+
+  private ensureEvaluationAnswerCards(actorId: string, evaluationId: string) {
+    return this.database.update((data) => {
+      const actor = this.ensureCurrentUser(data, actorId)
+      const evaluation = data.evaluations.find((item) => item.id === evaluationId)
+      if (!evaluation) throw new NotFoundException('Prova nao encontrada.')
+      if (!this.canAccessEvaluation(data, actor, evaluation)) throw new ForbiddenException('Seu perfil nao pode baixar estes cartoes.')
+      const classRoom = data.classes.find((item) => item.id === evaluation.classId)
+      if (!classRoom) throw new BadRequestException('Turma da prova nao encontrada.')
+
+      const existingCards = data.answerCards.filter((card) => card.evaluationId === evaluation.id)
+      const existingStudentIds = new Set(existingCards.map((card) => card.studentId))
+      const missingStudents = data.students.filter((student) => (
+        student.classId === classRoom.id
+        && student.schoolId === classRoom.schoolId
+        && student.status !== 'inativo'
+        && !existingStudentIds.has(student.id)
+      ))
+      if (!missingStudents.length) return
+
+      const now = new Date().toISOString()
+      const createdCards = this.answerCardCreationService.createCards({
+        evaluation,
+        classRoom,
+        students: missingStudents,
+        teacherId: evaluation.teacherId ?? actor.linkedTeacherId ?? actor.id,
+        now,
+        createId: (prefix) => this.createId(prefix),
+        startIndex: existingCards.length,
+      })
+      data.answerCards.push(...createdCards)
+      this.pushAudit(data, actorId, 'Gerou cartoes resposta da prova', `${evaluation.title} (${createdCards.length} cartoes)`)
+    })
+  }
+
+  getEvaluationCorrectionCardFile(actorId: string, correctionId: string): EvaluationDownloadFile {
+    const data = this.readDataForQuery()
+    const actor = this.ensureCurrentUser(data, actorId)
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (!this.canReadCorrectionCardFileRole(roleCode)) throw new ForbiddenException('Seu perfil nao pode baixar cartoes corrigidos.')
+    const correction = data.evaluationCorrections.find((item) => item.id === correctionId)
+    if (!correction) throw new NotFoundException('Correcao nao encontrada.')
+    const evaluation = data.evaluations.find((item) => item.id === correction.evaluationId)
+    if (!evaluation) throw new NotFoundException('Prova da correcao nao encontrada.')
+    if (!this.canAccessEvaluation(data, actor, evaluation)) throw new ForbiddenException('Sem acesso a esta correcao.')
+    const imageObject = correction.imageObject
+    if (!imageObject || imageObject.storageProvider !== 'local') throw new NotFoundException('Arquivo da correcao nao encontrado.')
+
+    const uploadsRoot = resolve(process.cwd(), 'uploads', 'private')
+    const filePath = resolve(uploadsRoot, imageObject.bucket, imageObject.key)
+    const legacyUploadsRoot = resolve(process.cwd(), 'uploads')
+    const legacyFilePath = resolve(legacyUploadsRoot, imageObject.bucket, imageObject.key)
+    const canReadPrivate = filePath.startsWith(`${uploadsRoot}${sep}`) && existsSync(filePath)
+    const canReadLegacy = legacyFilePath.startsWith(`${legacyUploadsRoot}${sep}`) && existsSync(legacyFilePath)
+    if (!canReadPrivate && !canReadLegacy) throw new NotFoundException('Arquivo da correcao nao encontrado.')
+
+    return {
+      filePath: canReadPrivate ? filePath : legacyFilePath,
+      filename: imageObject.originalName || `${correction.id}.jpg`,
+      contentType: imageObject.contentType || 'application/octet-stream',
+    }
+  }
+
   deleteEvaluation(actorId: string, id: string) {
     this.database.update((data) => {
+      const actor = this.ensureCurrentUser(data, actorId)
       const index = data.evaluations.findIndex((evaluation) => evaluation.id === id)
       if (index < 0) throw new NotFoundException('Prova nao encontrada.')
+      this.ensureEvaluationMutationAllowed(data, actor, data.evaluations[index])
 
       const [removed] = data.evaluations.splice(index, 1)
       this.pushAudit(data, actorId, 'Removeu prova', removed.title)
@@ -1528,8 +1821,10 @@ export class LiensinaService {
     const isSupportedFile = file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf'
     if (!isSupportedFile) throw new BadRequestException('Envie uma imagem ou PDF valido do cartao resposta.')
 
-    const snapshot = this.database.read()
+    const snapshot = this.readDataForQuery()
     const actor = this.ensureCurrentUser(snapshot, actorId)
+    const roleCode = this.getCurrentRoleCode(snapshot, actor)
+    if (!this.canRunOmrRole(roleCode)) throw new ForbiddenException('Seu perfil nao pode executar correcao OMR.')
     const evaluation = snapshot.evaluations.find((item) => item.id === evaluationId)
     if (!evaluation) throw new NotFoundException('Prova nao encontrada.')
     if (!this.canAccessEvaluation(snapshot, actor, evaluation)) throw new ForbiddenException('Sem acesso a esta prova.')
@@ -1542,8 +1837,9 @@ export class LiensinaService {
     const questions = this.resolveEvaluationQuestions(snapshot, evaluation)
     if (!questions.length) throw new BadRequestException('Esta prova nao possui questoes vinculadas para correcao.')
     const answerKey = this.buildEvaluationAnswerKey(questions)
-    const imageObject = this.saveEvaluationCorrectionImage(evaluationId, studentId, file)
-    const answerCardId = this.createId('answer-card')
+    const answerCard = snapshot.answerCards.find((card) => card.evaluationId === evaluation.id && card.studentId === studentId) ?? null
+    const imageObject = await this.saveEvaluationCorrectionImage(evaluationId, studentId, file)
+    const answerCardId = answerCard?.cardId ?? this.createId('answer-card')
     const omrPayload = {
       examId: evaluation.id,
       versionId: this.getEvaluationVersionId(evaluation),
@@ -1553,15 +1849,35 @@ export class LiensinaService {
       templateVersion: 'liensina-omr-v1',
       answerKey,
     }
-    const omrResponse = await this.requestOmrCorrection(file, omrPayload)
+    let omrResponse: OmrServiceResponse
+    try {
+      omrResponse = await this.requestOmrCorrection(file, omrPayload)
+    } catch (error) {
+      this.deleteStoredLocalFile(imageObject, 'private')
+      throw error
+    }
+    const resolvedTarget = this.resolveOmrTargetFromResponse(snapshot, evaluation, classRoom, omrResponse, {
+      fallbackStudent: student,
+      fallbackAnswerCard: answerCard,
+      fallbackCardId: answerCardId,
+      strictQrTarget: true,
+    })
+    if (resolvedTarget.student.id !== student.id) {
+      this.deleteStoredLocalFile(imageObject, 'private')
+      throw new BadRequestException('O cartao enviado pertence a outro aluno desta prova.')
+    }
     const now = new Date().toISOString()
     const correction: EvaluationCorrection = {
       id: this.createId('evaluation-correction'),
+      schoolId: classRoom.schoolId,
       evaluationId: evaluation.id,
       classId: classRoom.id,
       studentId,
+      studentName: student.name,
+      cardId: resolvedTarget.cardId ?? answerCardId,
+      subject: evaluation.subject,
       status: omrResponse.shouldRetakeImage ? 'NEEDS_RETAKE' : 'SUGGESTED',
-      imageUrl: imageObject.publicUrl,
+      imageUrl: '',
       imageObject,
       suggestedScore: this.toScore(omrResponse.suggestedScore),
       finalScore: null,
@@ -1584,21 +1900,220 @@ export class LiensinaService {
       createdAt: now,
       updatedAt: now,
     }
+    correction.imageUrl = `/api/evaluation-corrections/${correction.id}/image`
+    if (correction.imageObject) correction.imageObject.publicUrl = correction.imageUrl
 
     this.database.update((data) => {
       const existingIndex = data.evaluationCorrections.findIndex((item) => item.evaluationId === evaluationId && item.studentId === studentId)
       if (existingIndex >= 0) data.evaluationCorrections[existingIndex] = correction
       else data.evaluationCorrections.unshift(correction)
+      const persistedCard = data.answerCards.find((card) => card.evaluationId === evaluationId && card.studentId === studentId)
+      if (persistedCard) {
+        persistedCard.status = 'USED'
+        persistedCard.updatedAt = now
+      }
       this.pushAudit(data, actorId, 'Gerou sugestao de correcao OMR', `${evaluation.title} - ${student.name}`)
     })
 
     return correction
   }
 
-  reviewEvaluationCorrection(actorId: string, correctionId: string, payload: EvaluationCorrectionReviewPayload) {
-    let updated: EvaluationCorrection | null = null
+  async processEvaluationOmrBatch(actorId: string, evaluationId: string, files: OmrImageFile[], idempotencyKey?: string) {
+    const snapshot = this.readDataForQuery()
+    const actor = this.ensureCurrentUser(snapshot, actorId)
+    const roleCode = this.getCurrentRoleCode(snapshot, actor)
+    if (!this.canRunOmrRole(roleCode)) throw new ForbiddenException('Seu perfil nao pode executar correcao OMR.')
+    const evaluation = snapshot.evaluations.find((item) => item.id === evaluationId)
+    if (!evaluation) throw new NotFoundException('Prova nao encontrada.')
+    if (!this.canAccessEvaluation(snapshot, actor, evaluation)) throw new ForbiddenException('Sem acesso a esta prova.')
+    const classRoom = snapshot.classes.find((item) => item.id === evaluation.classId)
+    if (!classRoom) throw new BadRequestException('Turma da prova nao encontrada.')
+    const questions = this.resolveEvaluationQuestions(snapshot, evaluation)
+    if (!questions.length) throw new BadRequestException('Esta prova nao possui questoes vinculadas para correcao.')
+    const answerKey = this.buildEvaluationAnswerKey(questions)
+    if (!Array.isArray(files) || files.length === 0) throw new BadRequestException('Envie ao menos um cartao resposta.')
+    const maxBatchFiles = Math.max(1, Math.min(20, Number(this.configService.get<string>('OMR_MAX_BATCH_FILES') ?? 20) || 20))
+    if (files.length > maxBatchFiles) throw new BadRequestException(`Lote OMR excede o limite de ${maxBatchFiles} arquivos.`)
+    const totalSize = files.reduce((total, file) => total + Number(file.size ?? 0), 0)
+    const maxBatchBytes = Math.max(1, Math.min(48, Number(this.configService.get<string>('OMR_MAX_BATCH_MB') ?? 48) || 48)) * 1024 * 1024
+    if (totalSize > Math.min(maxOmrBatchTotalBytes, maxBatchBytes)) throw new BadRequestException('Lote OMR excede o limite total permitido.')
 
-    this.database.update((data) => {
+    const operation = async () => {
+      const corrections: EvaluationCorrection[] = []
+      const issues: OmrBatchIssue[] = []
+      const savedObjects = new Map<number, StoredImageObject>()
+      const persistedObjects = new Map<string, StoredImageObject>()
+      const sortedAnswerCards = this.getEvaluationAnswerCardsInPrintOrder(snapshot, evaluation.id)
+      const classStudents = snapshot.students.filter((student) => student.classId === classRoom.id)
+      const usedStudentIds = new Set<string>()
+      let globalPageIndex = 0
+
+      try {
+        for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+          const file = files[fileIndex]
+          const omrPayload = {
+            examId: evaluation.id,
+            versionId: this.getEvaluationVersionId(evaluation),
+            answerCardId: null,
+            studentId: null,
+            classId: classRoom.id,
+            templateVersion: 'liensina-omr-v1',
+            skipQr: true,
+            answerKey,
+          }
+
+          const responses = await this.requestOmrBatchCorrection(file, omrPayload)
+          for (const response of responses) {
+            const sourcePage = this.getOmrSourcePage(response)
+            const fallbackCard = sortedAnswerCards[globalPageIndex] ?? null
+            const fallbackStudent = fallbackCard
+              ? snapshot.students.find((student) => student.id === fallbackCard.studentId) ?? null
+              : classStudents[globalPageIndex] ?? null
+            globalPageIndex += 1
+
+            let target: OmrResolvedTarget
+            try {
+              target = this.resolveOmrTargetFromResponse(snapshot, evaluation, classRoom, response, {
+                fallbackStudent,
+                fallbackAnswerCard: fallbackCard,
+                fallbackCardId: fallbackCard?.cardId ?? null,
+                strictQrTarget: false,
+              })
+            } catch (error) {
+              issues.push({
+                fileName: this.safeOriginalFileName(file.originalname),
+                page: sourcePage,
+                reason: error instanceof Error ? error.message : 'Nao foi possivel identificar o aluno do cartao.',
+              })
+              continue
+            }
+
+            if (usedStudentIds.has(target.student.id)) {
+              issues.push({
+                fileName: this.safeOriginalFileName(file.originalname),
+                page: sourcePage,
+                reason: `Cartao duplicado para ${target.student.name}.`,
+              })
+              continue
+            }
+            usedStudentIds.add(target.student.id)
+
+            let sharedImageObject = savedObjects.get(fileIndex)
+            if (!sharedImageObject) {
+              sharedImageObject = await this.saveEvaluationCorrectionImage(evaluation.id, 'batch', file)
+              savedObjects.set(fileIndex, sharedImageObject)
+              persistedObjects.set(`${sharedImageObject.bucket}/${sharedImageObject.key}`, sharedImageObject)
+            }
+
+            const now = new Date().toISOString()
+            const correction: EvaluationCorrection = {
+              id: this.createId('evaluation-correction'),
+              schoolId: classRoom.schoolId,
+              evaluationId: evaluation.id,
+              classId: classRoom.id,
+              studentId: target.student.id,
+              studentName: target.student.name,
+              cardId: target.cardId,
+              subject: evaluation.subject,
+              status: response.shouldRetakeImage ? 'NEEDS_RETAKE' : 'SUGGESTED',
+              imageUrl: '',
+              imageObject: { ...sharedImageObject },
+              suggestedScore: this.toScore(response.suggestedScore),
+              finalScore: null,
+              correctCount: Number(response.correctCount) || 0,
+              wrongCount: Number(response.wrongCount) || 0,
+              blankCount: Number(response.blankCount) || 0,
+              multipleCount: Number(response.multipleCount) || 0,
+              totalQuestions: Number(response.totalQuestions) || answerKey.length,
+              confidence: this.toConfidence(response.confidence),
+              requiresReview: true,
+              shouldRetakeImage: Boolean(response.shouldRetakeImage),
+              failures: Array.isArray(response.failures) ? response.failures.map(String) : [],
+              detectedAnswers: this.normalizeCorrectionAnswers(response.detectedAnswers, answerKey),
+              answerKey,
+              rawOmrResponse: response,
+              teacherNotes: null,
+              reviewedById: null,
+              reviewedAt: null,
+              createdById: actorId,
+              createdAt: now,
+              updatedAt: now,
+            }
+            correction.imageUrl = `/api/evaluation-corrections/${correction.id}/image`
+            if (correction.imageObject) correction.imageObject.publicUrl = correction.imageUrl
+            corrections.push(correction)
+          }
+        }
+
+        if (!corrections.length) {
+          throw new BadRequestException(issues[0]?.reason ?? 'Nenhum cartao resposta do lote foi identificado para esta prova.')
+        }
+
+        await this.database.updateCommitted((data) => {
+          const currentActor = this.ensureCurrentUser(data, actorId)
+          const currentEvaluation = data.evaluations.find((item) => item.id === evaluationId)
+          if (!currentEvaluation) throw new NotFoundException('Prova nao encontrada.')
+          if (!this.canAccessEvaluation(data, currentActor, currentEvaluation)) throw new ForbiddenException('Sem acesso a esta prova.')
+
+          const now = new Date().toISOString()
+          for (const correction of corrections) {
+            const existingIndex = data.evaluationCorrections.findIndex((item) => item.evaluationId === correction.evaluationId && item.studentId === correction.studentId)
+            if (existingIndex >= 0) data.evaluationCorrections[existingIndex] = correction
+            else data.evaluationCorrections.unshift(correction)
+
+            const card = data.answerCards.find((item) => item.evaluationId === correction.evaluationId && item.studentId === correction.studentId)
+            if (card) {
+              card.status = 'USED'
+              card.updatedAt = now
+            }
+          }
+
+          this.pushAudit(data, actorId, 'Processou lote OMR', `${evaluation.title} (${corrections.length} cartoes)`)
+        })
+
+        return {
+          evaluationId,
+          status: issues.length ? 'COMPLETED_WITH_WARNINGS' : 'COMPLETED',
+          totalSent: files.length,
+          corrected: corrections.length,
+          needsReview: corrections.filter((correction) => correction.requiresReview).length,
+          errorCount: issues.length,
+          receivedCount: files.length,
+          processedCount: corrections.length,
+          skippedCount: issues.length,
+          corrections,
+          failures: issues,
+        }
+      } catch (error) {
+        for (const imageObject of persistedObjects.values()) this.deleteStoredLocalFile(imageObject, 'private')
+        throw error
+      }
+    }
+
+    return this.runIdempotentOperation(
+      actorId,
+      evaluation.schoolId ?? classRoom.schoolId ?? actor.schoolId,
+      'omr.batch',
+      evaluationId,
+      { evaluationId, files: files.map((file) => ({ name: file.originalname, size: file.size, type: file.mimetype })) },
+      idempotencyKey,
+      operation,
+    )
+  }
+
+  async reviewEvaluationCorrection(actorId: string, correctionId: string, payload: EvaluationCorrectionReviewPayload, idempotencyKey?: string) {
+    const snapshot = this.readDataForQuery()
+    const actor = this.ensureCurrentUser(snapshot, actorId)
+    const correction = snapshot.evaluationCorrections.find((item) => item.id === correctionId)
+    if (!correction) throw new NotFoundException('Correcao nao encontrada.')
+    const evaluation = snapshot.evaluations.find((item) => item.id === correction.evaluationId)
+    if (!evaluation) throw new NotFoundException('Prova da correcao nao encontrada.')
+    if (!this.canAccessEvaluation(snapshot, actor, evaluation)) throw new ForbiddenException('Sem acesso a esta correcao.')
+    const schoolId = correction.schoolId ?? evaluation.schoolId ?? snapshot.classes.find((classRoom) => classRoom.id === correction.classId)?.schoolId ?? actor.schoolId
+    const operation = async () => {
+      let updated: EvaluationCorrection | null = null
+
+      await this.database.updateCommitted((data) => {
       const actor = this.ensureCurrentUser(data, actorId)
       const correction = data.evaluationCorrections.find((item) => item.id === correctionId)
       if (!correction) throw new NotFoundException('Correcao nao encontrada.')
@@ -1624,18 +2139,91 @@ export class LiensinaService {
       updated = { ...correction }
     })
 
-    return updated!
+      return updated!
+    }
+
+    return this.runIdempotentOperation(actorId, schoolId, 'evaluation-corrections.review', correctionId, payload, idempotencyKey, operation)
+  }
+
+  async confirmEvaluationCorrections(
+    actorId: string,
+    evaluationId: string,
+    payload: { corrections?: Array<{ id: string; finalScore?: number | null; teacherNotes?: string | null }> },
+    idempotencyKey?: string,
+  ) {
+    const snapshot = this.readDataForQuery()
+    const actor = this.ensureCurrentUser(snapshot, actorId)
+    const evaluation = snapshot.evaluations.find((item) => item.id === evaluationId)
+    if (!evaluation) throw new NotFoundException('Prova nao encontrada.')
+    if (!this.canAccessEvaluation(snapshot, actor, evaluation)) throw new ForbiddenException('Sem acesso a esta prova.')
+
+    const schoolId = evaluation.schoolId ?? snapshot.classes.find((classRoom) => classRoom.id === evaluation.classId)?.schoolId ?? actor.schoolId
+    const operation = async () => {
+      let updatedCount = 0
+      const changed: EvaluationCorrection[] = []
+
+      await this.database.updateCommitted((data) => {
+        const currentActor = this.ensureCurrentUser(data, actorId)
+        const currentEvaluation = data.evaluations.find((item) => item.id === evaluationId)
+        if (!currentEvaluation) throw new NotFoundException('Prova nao encontrada.')
+        if (!this.canAccessEvaluation(data, currentActor, currentEvaluation)) throw new ForbiddenException('Sem acesso a esta prova.')
+        const corrections = Array.isArray(payload.corrections) ? payload.corrections : []
+        if (!corrections.length) throw new BadRequestException('Informe ao menos uma correcao para confirmar.')
+        const now = new Date().toISOString()
+
+        for (const item of corrections) {
+          const correction = data.evaluationCorrections.find((current) => current.id === item.id && current.evaluationId === evaluationId)
+          if (!correction) throw new NotFoundException('Correcao nao encontrada.')
+          correction.status = 'CONFIRMED'
+          correction.finalScore = item.finalScore == null ? this.toScore(correction.suggestedScore) : this.toScore(item.finalScore)
+          correction.teacherNotes = item.teacherNotes == null ? correction.teacherNotes : String(item.teacherNotes).slice(0, 1200)
+          correction.reviewedById = actorId
+          correction.reviewedAt = now
+          correction.updatedAt = now
+          updatedCount += 1
+          changed.push({ ...correction })
+        }
+
+        this.recalculateEvaluationCorrectionSummary(data, evaluationId)
+        this.pushAudit(data, actorId, 'Confirmou correcoes de prova', currentEvaluation.title)
+      })
+
+      return { evaluationId, updatedCount, corrections: changed }
+    }
+
+    return this.runIdempotentOperation(actorId, schoolId, 'evaluation-corrections.confirm', evaluationId, payload, idempotencyKey, operation)
   }
 
   createQuestion(actorId: string, payload: CreateQuestionRequest & { status?: QuestionStatus }) {
     this.ensureRequired(payload, ['title', 'statement', 'gradeLevel', 'area', 'component', 'subject', 'difficulty', 'sourceType', 'sourceName', 'visibility'])
+    this.rejectControlledFields(payload as unknown as Record<string, unknown>, ['id', 'schoolId', 'networkId', 'createdById', 'reviewedById', 'reviewedAt', 'createdAt', 'updatedAt', 'archivedAt', 'reviews', 'status'])
+    if (payload.metadata?.requestedStatus) {
+      throw new BadRequestException('Status de questao deve ser alterado apenas pelo fluxo de revisao.')
+    }
 
-    const requestedStatus = payload.status ?? this.normalizeQuestionStatus(payload.metadata?.requestedStatus, 'DRAFT')
     const questionId = this.createId('question')
     let created: Question | null = null
 
     this.database.update((data) => {
       const actor = this.ensureCurrentUser(data, actorId)
+      const roleCode = this.getCurrentRoleCode(data, actor)
+      if (!['SUPERADMIN', 'ADMIN', 'ADMIN_ESCOLA', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) {
+        throw new ForbiddenException('Seu perfil nao pode criar questoes.')
+      }
+      const requestedVisibility = this.normalizeQuestionVisibility(payload.visibility)
+      if ((requestedVisibility === 'GLOBAL' || requestedVisibility === 'NETWORK') && !this.isSuperAdminRole(roleCode)) {
+        throw new ForbiddenException('Apenas administradores globais podem publicar questoes globais.')
+      }
+      if (!this.isSuperAdminRole(roleCode) && !actor.schoolId) {
+        throw new ForbiddenException('Usuario sem escola vinculada nao pode criar questoes escolares.')
+      }
+      const status = this.normalizeQuestionStatus(undefined, 'PENDING_REVIEW')
+      const sourceType = roleCode === 'PROFESSOR'
+        ? 'TEACHER_CREATED'
+        : this.normalizeQuestionSourceType(payload.sourceType)
+      if (!this.isSuperAdminRole(roleCode) && ['INEP_ENEM', 'GLOBAL_CURATED'].includes(sourceType)) {
+        throw new ForbiddenException('Fonte de questao restrita a curadoria global.')
+      }
       const skills = (payload.skillIds ?? []).map((skillId) => {
         const skill = data.curriculumSkills.find((item) => item.id === skillId)
         if (!skill) throw new BadRequestException('Habilidade informada nao existe.')
@@ -1680,17 +2268,17 @@ export class LiensinaService {
         component: String(payload.component).trim(),
         subject: String(payload.subject).trim(),
         difficulty: this.normalizeDifficulty(payload.difficulty),
-        sourceType: this.normalizeQuestionSourceType(payload.sourceType),
+        sourceType,
         sourceName: String(payload.sourceName).trim(),
         sourceYear: payload.sourceYear ? Number(payload.sourceYear) : new Date().getFullYear(),
         sourceExternalId: payload.sourceExternalId ? String(payload.sourceExternalId).trim() : null,
         sourceUrl: payload.sourceUrl ? String(payload.sourceUrl).trim() : null,
         licenseNotes: payload.licenseNotes ? String(payload.licenseNotes).trim() : null,
-        visibility: this.normalizeQuestionVisibility(payload.visibility),
-        status: requestedStatus,
+        visibility: requestedVisibility,
+        status,
         isEditable: true,
-        reviewedById: requestedStatus === 'APPROVED' ? actor.id : null,
-        reviewedAt: requestedStatus === 'APPROVED' ? now : null,
+        reviewedById: null,
+        reviewedAt: null,
         createdAt: now,
         updatedAt: now,
         archivedAt: null,
@@ -1699,7 +2287,7 @@ export class LiensinaService {
         skills,
         descriptors,
         attachments: [],
-        reviews: requestedStatus === 'APPROVED'
+        reviews: status === 'APPROVED'
           ? [{
               id: this.createId('question-review'),
               questionId,
@@ -1720,7 +2308,7 @@ export class LiensinaService {
 
   deleteQuestion(actorId: string, id: string) {
     this.database.update((data) => {
-      this.ensureCurrentUser(data, actorId)
+      const actor = this.ensureCurrentUser(data, actorId)
       const index = data.questions.findIndex((question) => question.id === id)
       if (index < 0) throw new NotFoundException('Questão não encontrada.')
 
@@ -1728,6 +2316,7 @@ export class LiensinaService {
       if (question.sourceType !== 'TEACHER_CREATED' || !question.isEditable) {
         throw new ForbiddenException('Somente questoes criadas pelo professor podem ser excluidas.')
       }
+      this.ensureQuestionMutationAllowed(data, actor, question)
 
       const [removed] = data.questions.splice(index, 1)
       data.evaluations = data.evaluations.map((evaluation) => (
@@ -1745,6 +2334,52 @@ export class LiensinaService {
     return { success: true }
   }
 
+  reviewQuestion(actorId: string, id: string, payload: { action: 'APPROVE' | 'REJECT'; reason?: string | null }) {
+    let updated: Question | null = null
+
+    this.database.update((data) => {
+      const actor = this.ensureCurrentUser(data, actorId)
+      const roleCode = this.getCurrentRoleCode(data, actor)
+      const role = data.roles.find((item) => item.id === actor.roleId || item.code === actor.roleId)
+      const hasExplicitPermission = role?.permissions?.some((permission) => ['questions:review', 'CAN_REVIEW_QUESTIONS'].includes(permission)) ?? false
+      if (!this.isSuperAdminRole(roleCode) && !this.isSchoolAdminRole(roleCode) && !hasExplicitPermission) {
+        throw new ForbiddenException('Seu perfil nao pode revisar questoes.')
+      }
+
+      const question = data.questions.find((item) => item.id === id)
+      if (!question) throw new NotFoundException('Questao nao encontrada.')
+      if (!this.isSuperAdminRole(roleCode) && actor.schoolId && question.schoolId !== actor.schoolId) {
+        throw new ForbiddenException('Sem permissao para revisar esta questao.')
+      }
+      if (question.createdById === actor.id || question.createdById === actor.linkedTeacherId) {
+        throw new ForbiddenException('Criador da questao nao pode aprovar a propria questao.')
+      }
+      if (question.status === 'ARCHIVED') throw new BadRequestException('Questao arquivada nao pode ser revisada.')
+
+      const now = new Date().toISOString()
+      const approved = payload.action === 'APPROVE'
+      question.status = approved ? 'APPROVED' : 'REJECTED'
+      question.reviewedById = actor.id
+      question.reviewedAt = now
+      question.updatedAt = now
+      question.reviews = [
+        {
+          id: this.createId('question-review'),
+          questionId: question.id,
+          reviewerId: actor.id,
+          status: approved ? 'APPROVED' : 'REJECTED',
+          comment: String(payload.reason ?? '').slice(0, 1200),
+          reviewedAt: now,
+        },
+        ...(question.reviews ?? []),
+      ]
+      updated = { ...question }
+      this.pushAudit(data, actorId, approved ? 'Aprovou questao' : 'Rejeitou questao', question.title)
+    })
+
+    return updated!
+  }
+
   generateQuestionSelection(actorId: string, payload: GenerateQuestionSelectionRequest): GenerateQuestionSelectionResponse {
     const requestedQuantity = this.normalizeQuestionQuantity(payload.quantity)
     const subjectFilter = this.normalizeTextKey(payload.subject)
@@ -1755,7 +2390,7 @@ export class LiensinaService {
     const skillFilter = this.normalizeSelectionFilter(payload.skillCode)
     const descriptorFilter = this.normalizeSelectionFilter(payload.descriptorCode)
     const sourceMode = payload.sourceMode === 'enem' || payload.sourceMode === 'mixed' ? payload.sourceMode : 'system'
-    const data = this.database.read()
+    const data = this.readDataForQuery()
     const actor = this.ensureCurrentUser(data, actorId)
     const roleCode = this.getCurrentRoleCode(data, actor)
 
@@ -1791,9 +2426,9 @@ export class LiensinaService {
     const years = this.normalizeEnemYears(payload.years)
     const disciplineFilter = this.normalizeEnemDisciplineFilter(payload.discipline ?? payload.subject)
 
-    this.ensureCurrentUser(this.database.read(), actorId)
+    this.ensureCurrentUser(this.readDataForQuery(), actorId)
 
-    const currentData = this.database.read()
+    const currentData = this.readDataForQuery()
     const cachedQuestions = currentData.questions.filter((question) =>
       question.sourceType === 'INEP_ENEM' &&
       question.sourceYear !== null &&
@@ -1938,16 +2573,20 @@ export class LiensinaService {
     return updated!
   }
 
-  listCalendarEvents() {
-    return this.database.read().calendarEvents
+  listCalendarEvents(actorId: string) {
+    const data = this.readDataForQuery()
+    const actor = this.ensureCurrentUser(data, actorId)
+    return this.getScopedDatabaseView(data, actor).calendarEvents
   }
 
   createCalendarEvent(actorId: string, payload: Partial<SchoolCalendarEvent>) {
     this.ensureRequired(payload, ['title', 'type', 'schoolId', 'startsAt', 'endsAt'])
+    this.rejectControlledFields(payload, ['id', 'createdById'])
     let calendarEvent: SchoolCalendarEvent | null = null
 
     this.database.update((data) => {
-      this.ensureCurrentUser(data, actorId)
+      const actor = this.ensureCurrentUser(data, actorId)
+      this.ensureCalendarEventScopeAllowed(data, actor, payload)
       calendarEvent = this.buildCalendarEvent(data, { ...payload, createdById: actorId })
       data.calendarEvents.unshift(calendarEvent)
       this.pushAudit(data, actorId, 'Criou evento no calendario', calendarEvent.title)
@@ -1957,6 +2596,7 @@ export class LiensinaService {
   }
 
   updateCalendarEvent(actorId: string, id: string, payload: Partial<SchoolCalendarEvent>) {
+    this.rejectControlledFields(payload, ['id', 'createdById'])
     let updated: SchoolCalendarEvent | null = null
 
     this.database.update((data) => {
@@ -1964,8 +2604,11 @@ export class LiensinaService {
       if (index < 0) throw new NotFoundException('Evento de calendario nao encontrado.')
 
       const current = data.calendarEvents[index]
+      const actor = this.ensureCurrentUser(data, actorId)
       this.ensureCalendarEventMutationAllowed(data, actorId, current)
-      updated = this.buildCalendarEvent(data, { ...current, ...payload, id, createdById: current.createdById }, id)
+      const candidate = { ...current, ...payload, id, createdById: current.createdById }
+      this.ensureCalendarEventScopeAllowed(data, actor, candidate)
+      updated = this.buildCalendarEvent(data, candidate, id)
       data.calendarEvents[index] = updated
       this.pushAudit(data, actorId, 'Atualizou evento no calendario', updated.title)
     })
@@ -2034,18 +2677,56 @@ export class LiensinaService {
     return lessonRecord!
   }
 
+  updateLessonRecord(actorId: string, id: string, payload: Partial<LessonRecord>) {
+    let lessonRecord: LessonRecord | null = null
+
+    this.database.update((data) => {
+      const currentUser = this.ensureCurrentUser(data, actorId)
+      const roleCode = data.roles.find((role) => role.id === currentUser.roleId)?.code
+        ?? data.roles.find((role) => role.id === currentUser.roleId)?.name
+      if (!['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(String(roleCode ?? ''))) {
+        throw new ForbiddenException('Seu perfil nao pode atualizar registros de aula.')
+      }
+
+      const index = data.lessonRecords.findIndex((record) => record.id === id)
+      if (index < 0) throw new NotFoundException('Registro de aula nao encontrado.')
+
+      const scoped = this.getScopedSchoolsData(data, currentUser)
+      const allowedClassIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+      const merged = { ...data.lessonRecords[index], ...payload }
+      const classRoom = data.classes.find((item) => item.id === String(merged.classId ?? '').trim())
+
+      if (!classRoom) throw new BadRequestException('Turma informada nao existe.')
+      if (!allowedClassIds.has(classRoom.id)) throw new ForbiddenException('Seu perfil nao pode atualizar aula nesta turma.')
+
+      lessonRecord = this.buildLessonRecord(data, merged, id)
+      data.lessonRecords[index] = lessonRecord
+      this.pushAudit(data, actorId, 'Atualizou aula', `${lessonRecord.subject} - ${classRoom.name}`)
+    })
+
+    return lessonRecord!
+  }
+
   updateRole(actorId: string, id: string, payload: Partial<Role>) {
+    this.rejectControlledFields(payload, ['id', 'code', 'name'])
     let updated: Role | null = null
     this.database.update((data) => {
+      this.ensureGlobalAdmin(data, actorId)
       const index = data.roles.findIndex((role) => role.id === id)
       if (index < 0) throw new NotFoundException('Cargo nao encontrado.')
-      const roleCode = payload.code ?? data.roles[index].code
+      const roleCode = data.roles[index].code
       const deniedPermissions = forbiddenRolePermissions[roleCode] ?? []
       const permissions = Array.isArray(payload.permissions)
         ? payload.permissions.filter((permission) => !deniedPermissions.includes(permission))
         : data.roles[index].permissions.filter((permission) => !deniedPermissions.includes(permission))
-      updated = { ...data.roles[index], ...payload, id, permissions }
+      updated = {
+        ...data.roles[index],
+        id,
+        description: payload.description === undefined ? data.roles[index].description : String(payload.description).trim(),
+        permissions,
+      }
       data.roles[index] = updated
+      this.revokeRefreshSessionsForRole(data, id)
       this.pushAudit(data, actorId, 'Atualizou permissoes do cargo', updated.name)
     })
     return updated!
@@ -2054,11 +2735,18 @@ export class LiensinaService {
   updateUserRole(actorId: string, id: string, roleId: string) {
     let updated: UserAccount | null = null
     const data = this.database.update((data) => {
-      if (!data.roles.some((role) => role.id === roleId)) throw new BadRequestException('Cargo informado nao existe.')
+      const actor = this.ensureGlobalAdmin(data, actorId)
+      if (actor.id === id) throw new ForbiddenException('Nao e permitido alterar o proprio cargo.')
+      const role = this.resolveRole(data, roleId)
+      if (!role) throw new BadRequestException('Cargo informado nao existe.')
+      if (role.code === 'SUPERADMIN' && !this.isSuperAdminRole(this.getCurrentRoleCode(data, actor))) {
+        throw new ForbiddenException('Apenas SUPERADMIN pode criar ou atribuir SUPERADMIN.')
+      }
       const index = data.users.findIndex((user) => user.id === id)
       if (index < 0) throw new NotFoundException('Usuario nao encontrado.')
-      updated = { ...data.users[index], roleId }
+      updated = { ...data.users[index], roleId: role.id }
       data.users[index] = updated
+      this.revokeRefreshSessionsForUser(data, id)
       this.pushAudit(data, actorId, 'Alterou cargo do usuario', updated.name)
     })
     return this.toPublicUserWithResolvedSchool(data, updated!)
@@ -2067,7 +2755,7 @@ export class LiensinaService {
   updateUserSchool(actorId: string, id: string, schoolId: string | null | undefined) {
     let updated: UserAccount | null = null
     const data = this.database.update((data) => {
-      this.ensureRole(data, actorId, 'ADMIN')
+      this.ensureGlobalAdmin(data, actorId)
       const normalizedSchoolId = schoolId === null || schoolId === undefined || String(schoolId).trim() === '' || String(schoolId).trim() === 'network'
         ? null
         : String(schoolId).trim()
@@ -2076,12 +2764,14 @@ export class LiensinaService {
       if (index < 0) throw new NotFoundException('Usuario nao encontrado.')
       updated = { ...data.users[index], schoolId: normalizedSchoolId }
       data.users[index] = updated
+      this.revokeRefreshSessionsForUser(data, id)
       this.pushAudit(data, actorId, 'Alterou escola vinculada do usuario', `${updated.name} - ${school?.name ?? 'Sem escola vinculada'}`)
     })
     return this.toPublicUserWithResolvedSchool(data, updated!)
   }
 
   updateProfile(actorId: string, payload: Partial<UserAccount>) {
+    this.rejectControlledFields(payload, ['id', 'roleId', 'schoolId', 'status', 'password', 'tokenVersion', 'passwordHash', 'refreshTokenHash', 'avatarUrl', 'bannerUrl', 'avatarObject', 'bannerObject', 'linkedTeacherId', 'linkedStudentId', 'linkedGuardianId'])
     let updated: UserAccount | null = null
     const data = this.database.update((data) => {
       const index = data.users.findIndex((user) => user.id === actorId)
@@ -2091,10 +2781,6 @@ export class LiensinaService {
       updated = {
         ...current,
         ...profile,
-        avatarUrl: payload.avatarUrl ?? current.avatarUrl,
-        bannerUrl: payload.bannerUrl ?? current.bannerUrl,
-        avatarObject: payload.avatarObject !== undefined ? payload.avatarObject : current.avatarObject,
-        bannerObject: payload.bannerObject !== undefined ? payload.bannerObject : current.bannerObject,
       }
       data.users[index] = updated
       this.syncLinkedProfile(data, current, updated)
@@ -2103,37 +2789,73 @@ export class LiensinaService {
     return this.toPublicUserWithResolvedSchool(data, updated!)
   }
 
-  updateProfileAvatar(actorId: string, file: ProfileImageFile) {
+  async updateProfileAvatar(actorId: string, file: ProfileImageFile) {
     const current = this.getUserById(actorId)
-    const avatarObject = this.saveProfileImageFile(actorId, file, 'avatars')
+    const avatarObject = await this.saveProfileImageFile(actorId, file, 'avatars')
     this.deleteProfileImageFile(current.avatarObject ?? current.avatarUrl)
-    return this.updateProfile(actorId, { avatarUrl: avatarObject.publicUrl, avatarObject })
+    return this.updateProfileMedia(actorId, { avatarUrl: avatarObject.publicUrl, avatarObject })
   }
 
-  updateProfileBanner(actorId: string, file: ProfileImageFile) {
+  async updateProfileBanner(actorId: string, file: ProfileImageFile) {
     const current = this.getUserById(actorId)
-    const bannerObject = this.saveProfileImageFile(actorId, file, 'banners')
+    const bannerObject = await this.saveProfileImageFile(actorId, file, 'banners')
     this.deleteProfileImageFile(current.bannerObject ?? current.bannerUrl)
-    return this.updateProfile(actorId, { bannerUrl: bannerObject.publicUrl, bannerObject })
+    return this.updateProfileMedia(actorId, { bannerUrl: bannerObject.publicUrl, bannerObject })
   }
 
   deleteProfileAvatar(actorId: string) {
     const current = this.getUserById(actorId)
     this.deleteProfileImageFile(current.avatarObject ?? current.avatarUrl)
-    return this.updateProfile(actorId, { avatarUrl: '', avatarObject: null })
+    return this.updateProfileMedia(actorId, { avatarUrl: '', avatarObject: null })
   }
 
   deleteProfileBanner(actorId: string) {
     const current = this.getUserById(actorId)
     this.deleteProfileImageFile(current.bannerObject ?? current.bannerUrl)
-    return this.updateProfile(actorId, { bannerUrl: '', bannerObject: null })
+    return this.updateProfileMedia(actorId, { bannerUrl: '', bannerObject: null })
+  }
+
+  private updateProfileMedia(actorId: string, media: Pick<Partial<UserAccount>, 'avatarUrl' | 'bannerUrl' | 'avatarObject' | 'bannerObject'>) {
+    let updated: UserAccount | null = null
+    const data = this.database.update((data) => {
+      const index = data.users.findIndex((user) => user.id === actorId)
+      if (index < 0) throw new NotFoundException('Usuario nao encontrado.')
+      const current = data.users[index]
+      updated = { ...current, ...media }
+      data.users[index] = updated
+      this.syncLinkedProfile(data, current, updated)
+      this.pushAudit(data, actorId, 'Atualizou midia do perfil', updated.name)
+    })
+    return this.toPublicUserWithResolvedSchool(data, updated!)
   }
 
   private syncNotificationsForUser(userId: string) {
+    const currentData = this.readDataForQuery()
+    const currentUser = this.ensureCurrentUser(currentData, userId)
+    if (!this.shouldSyncNotificationsForUser(currentData, currentUser)) return currentData
+
     return this.database.update((data) => {
-      const currentUser = this.ensureCurrentUser(data, userId)
-      this.syncNotificationsForUserInData(data, currentUser)
+      const writableUser = this.ensureCurrentUser(data, userId)
+      this.syncNotificationsForUserInData(data, writableUser)
     })
+  }
+
+  private shouldSyncNotificationsForUser(data: DatabaseShape, currentUser: UserAccount) {
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const highRiskStudents = scoped.students.filter((student) => student.status === 'matriculado' && student.desempenho === 'Baixo')
+
+    for (const student of highRiskStudents) {
+      const existing = data.notifications.find((notification) => (
+        notification.userId === currentUser.id
+        && notification.sourceType === 'student-risk'
+        && notification.sourceId === student.id
+      ))
+      const title = `${student.name} em risco pedagogico`
+      const description = `Frequencia ${student.attendanceRate}% e media ${student.averageScore.toFixed(1)}. Recomenda-se intervencao da coordenacao.`
+      if (!existing || existing.title !== title || existing.description !== description || existing.tone !== 'danger') return true
+    }
+
+    return false
   }
 
   private syncNotificationsForUserInData(data: DatabaseShape, currentUser: UserAccount) {
@@ -2195,13 +2917,46 @@ export class LiensinaService {
     return data.notifications.filter((notification) => notification.userId === userId && !notification.readAt).length
   }
 
-  private buildDashboard(data: DatabaseShape = this.database.read(), alertPage: string | number = 1, alertLimit: string | number = 10) {
-    const studentsWithVisuals = data.students.map((student) => this.withLinkedUserVisuals(student, data.users))
-    const activeStudents = studentsWithVisuals.filter((student) => student.status === 'matriculado')
+  private dashboardEvaluationDto(evaluation: Evaluation): Evaluation {
+    return {
+      id: evaluation.id,
+      schoolId: evaluation.schoolId,
+      teacherId: evaluation.teacherId,
+      title: evaluation.title,
+      classId: evaluation.classId,
+      subject: evaluation.subject,
+      questions: evaluation.questions,
+      scheduledAt: evaluation.scheduledAt,
+      status: evaluation.status,
+      corrected: evaluation.corrected,
+      participants: evaluation.participants,
+      averageScore: evaluation.averageScore,
+      triLevel: evaluation.triLevel,
+      buildMode: evaluation.buildMode,
+      createdById: evaluation.createdById,
+      createdByName: evaluation.createdByName,
+      createdBy: evaluation.createdBy,
+    } as Evaluation
+  }
+
+  private buildDashboard(data: DatabaseShape = this.readDataForQuery(), alertPage: string | number = 1, alertLimit: string | number = 10) {
+    const activeStudents = data.students.filter((student) => student.status === 'matriculado')
     const avgAttendance = this.average(activeStudents.map((student) => student.attendanceRate))
     const avgScore = this.average(activeStudents.map((student) => student.averageScore))
     const highRisk = activeStudents.filter((student) => student.desempenho === 'Baixo')
     const classNameById = new Map(data.classes.map((classRoom) => [classRoom.id, classRoom.name]))
+    const studentsByClassId = new Map<string, Student[]>()
+    const proficiencyCounts = { belowBasic: 0, basic: 0, adequate: 0, advanced: 0 }
+    for (const student of activeStudents) {
+      const classStudents = studentsByClassId.get(student.classId) ?? []
+      classStudents.push(student)
+      studentsByClassId.set(student.classId, classStudents)
+
+      if (student.averageScore < 6) proficiencyCounts.belowBasic += 1
+      else if (student.averageScore < 7.5) proficiencyCounts.basic += 1
+      else if (student.averageScore < 9) proficiencyCounts.adequate += 1
+      else proficiencyCounts.advanced += 1
+    }
     const alerts = highRisk.map((student) => ({
       id: `alert-${student.id}`,
       title: `${student.name} em risco pedagogico`,
@@ -2229,14 +2984,14 @@ export class LiensinaService {
         { id: 'risk', label: 'Risco alto', value: String(highRisk.length), detail: 'Alunos exigindo intervencao', tone: 'rose' as const },
       ],
       attendanceByClass: data.classes.map((classRoom) => {
-        const students = activeStudents.filter((student) => student.classId === classRoom.id)
+        const students = studentsByClassId.get(classRoom.id) ?? []
         return { className: classRoom.name, frequencia: Math.round(this.average(students.map((student) => student.attendanceRate))), media: Number(this.average(students.map((student) => student.averageScore)).toFixed(1)) }
       }),
       proficiencyDistribution: [
-        { level: 'Abaixo do basico', alunos: activeStudents.filter((student) => student.averageScore < 6).length },
-        { level: 'Basico', alunos: activeStudents.filter((student) => student.averageScore >= 6 && student.averageScore < 7.5).length },
-        { level: 'Adequado', alunos: activeStudents.filter((student) => student.averageScore >= 7.5 && student.averageScore < 9).length },
-        { level: 'Avancado', alunos: activeStudents.filter((student) => student.averageScore >= 9).length },
+        { level: 'Abaixo do basico', alunos: proficiencyCounts.belowBasic },
+        { level: 'Basico', alunos: proficiencyCounts.basic },
+        { level: 'Adequado', alunos: proficiencyCounts.adequate },
+        { level: 'Avancado', alunos: proficiencyCounts.advanced },
       ],
       subjectRadar: [
         { subject: 'Portugues', acertos: 72 },
@@ -2256,7 +3011,7 @@ export class LiensinaService {
 
   private ensureCurrentMonthMealManagements(actorId?: string) {
     const mesReferencia = this.getCurrentReferenceMonth()
-    if (!this.hasMissingMealManagements(this.database.read(), mesReferencia)) return
+    if (!this.hasMissingMealManagements(this.readDataForQuery(), mesReferencia)) return
 
     this.database.update((data) => {
       this.createMissingMealManagements(data, mesReferencia, actorId)
@@ -2265,7 +3020,7 @@ export class LiensinaService {
 
   private ensureMealManagementDataReady(actorId?: string) {
     const mesReferencia = this.getCurrentReferenceMonth()
-    const currentData = this.database.read()
+    const currentData = this.readDataForQuery()
     const hasApprovedRequestsWaitingForStock = currentData.mealFoodRequests.some((request) => (
       request.status === 'APPROVED_BY_NUTRITIONIST' && !request.stockItemId
     ))
@@ -2864,31 +3619,51 @@ export class LiensinaService {
     return date
   }
 
-  private async issueAccessToken(user: UserAccount) {
+  private async issueAccessToken(user: UserAccount, sessionId: string) {
     const expiresIn = this.accessTokenTtlSeconds
     const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString()
-    const payload: JwtPayload = { sub: user.id, email: user.email, typ: 'access' }
+    const payload: JwtPayload = { sub: user.id, typ: 'access', sid: sessionId, jti: randomUUID() }
+    const secret = this.configService.get<string>('JWT_ACCESS_SECRET')
+    if (!secret) throw new Error('JWT_ACCESS_SECRET ausente.')
 
     return {
-      token: await this.jwtService.signAsync(payload),
+      token: await this.jwtService.signAsync(payload, {
+        secret,
+        expiresIn,
+        issuer: this.configService.get<string>('JWT_ISSUER') ?? 'liensina-api',
+        audience: this.configService.get<string>('JWT_AUDIENCE') ?? 'liensina-web',
+      }),
       expiresIn,
       expiresAt,
     }
   }
 
   private createRefreshSession(userId: string, context: AuthContext, rotatedFromId?: string) {
-    const token = randomBytes(64).toString('base64url')
+    const sessionId = randomUUID()
+    const jti = randomUUID()
     const now = new Date()
     const expiresAt = new Date(now.getTime() + this.refreshTokenTtlDays * 24 * 60 * 60 * 1000)
+    const secret = this.configService.get<string>('JWT_REFRESH_SECRET')
+    if (!secret) throw new Error('JWT_REFRESH_SECRET ausente.')
+    const token = this.jwtService.sign(
+      { sub: userId, typ: 'refresh', sid: sessionId, jti } satisfies JwtPayload,
+      {
+        secret,
+        expiresIn: this.refreshTokenTtlDays * 24 * 60 * 60,
+        issuer: this.configService.get<string>('JWT_ISSUER') ?? 'liensina-api',
+        audience: this.configService.get<string>('JWT_AUDIENCE') ?? 'liensina-web',
+      },
+    )
     const session: RefreshSession = {
-      id: randomUUID(),
+      id: sessionId,
       userId,
+      jti,
       tokenHash: this.hashRefreshToken(token),
       createdAt: now.toISOString(),
       expiresAt: expiresAt.toISOString(),
       rotatedFromId,
       userAgent: context.userAgent?.slice(0, 240),
-      ip: context.ip?.slice(0, 80),
+      ipHash: this.hashContextValue(context.ip),
     }
 
     return { token, session }
@@ -2897,27 +3672,45 @@ export class LiensinaService {
   private removeExpiredRefreshSessions(data: { refreshSessions: RefreshSession[] }) {
     const now = Date.now()
     data.refreshSessions = data.refreshSessions.filter((session) => {
-      if (new Date(session.expiresAt).getTime() <= now) return false
-      if (!session.revokedAt) return true
+      if (!session.revokedAt) return new Date(session.expiresAt).getTime() > now
 
       const revokedAt = new Date(session.revokedAt).getTime()
-      return Number.isFinite(revokedAt) && now - revokedAt <= this.refreshReuseGraceMs
+      return Number.isFinite(revokedAt) && now - revokedAt <= this.refreshRevokedRetentionMs
     })
-  }
-
-  private isRecentRefreshReuse(session: RefreshSession, context: AuthContext) {
-    if (!session.revokedAt) return false
-
-    const revokedAt = new Date(session.revokedAt).getTime()
-    if (!Number.isFinite(revokedAt)) return false
-    if (Date.now() - revokedAt > this.refreshReuseGraceMs) return false
-
-    if (session.userAgent && context.userAgent && session.userAgent !== context.userAgent.slice(0, 240)) return false
-    return true
   }
 
   private hashRefreshToken(token: string) {
     return createHash('sha256').update(token).digest('hex')
+  }
+
+  private hashContextValue(value?: string) {
+    const normalized = String(value ?? '').trim()
+    if (!normalized) return undefined
+    return createHash('sha256').update(normalized).digest('hex')
+  }
+
+  private async verifyRefreshToken(token: string) {
+    try {
+      const secret = this.configService.get<string>('JWT_REFRESH_SECRET')
+      if (!secret) throw new UnauthorizedException('Configuracao de refresh token ausente.')
+      const payload = await this.jwtService.verifyAsync<JwtPayload>(token, {
+        secret,
+        issuer: this.configService.get<string>('JWT_ISSUER') ?? 'liensina-api',
+        audience: this.configService.get<string>('JWT_AUDIENCE') ?? 'liensina-web',
+      })
+      if (payload.typ !== 'refresh' || !payload.sub || !payload.sid || !payload.jti) {
+        throw new UnauthorizedException('Refresh token invalido.')
+      }
+      return payload
+    } catch {
+      throw new UnauthorizedException('Refresh token invalido.')
+    }
+  }
+
+  isSessionActive(userId: string, sessionId: string) {
+    const now = Date.now()
+    const session = this.readDataForQuery().refreshSessions.find((item) => item.id === sessionId && item.userId === userId)
+    return Boolean(session && !session.revokedAt && new Date(session.expiresAt).getTime() > now)
   }
 
   private isPasswordValid(plainPassword: string, storedPassword: string) {
@@ -2942,7 +3735,7 @@ export class LiensinaService {
   }
 
   private get accessTokenTtlSeconds() {
-    return parseDurationSeconds(this.configService.get<string>('JWT_ACCESS_EXPIRES_IN'), 30 * 60)
+    return parseDurationSeconds(this.configService.get<string>('JWT_ACCESS_EXPIRES_IN'), 15 * 60)
   }
 
   private get refreshTokenTtlDays() {
@@ -2950,9 +3743,9 @@ export class LiensinaService {
     return Number.isFinite(days) && days > 0 ? days : 7
   }
 
-  private get refreshReuseGraceMs() {
-    const seconds = Number(this.configService.get<string>('REFRESH_TOKEN_REUSE_GRACE_SECONDS') ?? defaultRefreshReuseGraceSeconds)
-    return (Number.isFinite(seconds) && seconds >= 0 ? seconds : defaultRefreshReuseGraceSeconds) * 1000
+  private get refreshRevokedRetentionMs() {
+    const seconds = Number(this.configService.get<string>('REFRESH_TOKEN_REVOKED_RETENTION_SECONDS') ?? 24 * 60 * 60)
+    return Math.max(60, Number.isFinite(seconds) ? seconds : 24 * 60 * 60) * 1000
   }
 
   private paginate<T>(items: T[], rawPage: string | number = 1, rawLimit: string | number = 10, defaultLimit = 10) {
@@ -2975,13 +3768,14 @@ export class LiensinaService {
   }
 
   private getScopedSchoolsData(data: DatabaseShape, currentUser: UserAccount) {
-    const studentsWithVisuals = data.students.map((student) => this.withLinkedUserVisuals(student, data.users))
-    const teachersWithVisuals = data.teachers.map((teacher) => this.withLinkedUserVisuals(teacher, data.users))
-    const guardiansWithVisuals = data.guardians.map((guardian) => this.withLinkedUserVisuals(guardian, data.users))
+    const userVisualIndex = this.buildUserVisualIndex(data.users)
+    const studentsWithVisuals = data.students.map((student) => this.withLinkedUserVisualsFromIndex(student, userVisualIndex))
+    const teachersWithVisuals = data.teachers.map((teacher) => this.withLinkedUserVisualsFromIndex(teacher, userVisualIndex))
+    const guardiansWithVisuals = data.guardians.map((guardian) => this.withLinkedUserVisualsFromIndex(guardian, userVisualIndex))
     const role = data.roles.find((item) => item.id === currentUser.roleId)
     const roleCode = role?.code ?? role?.name
 
-    if (roleCode === 'ADMIN') {
+    if (roleCode === 'SUPERADMIN' || roleCode === 'ADMIN') {
       return {
         schools: data.schools,
         classes: data.classes,
@@ -3000,7 +3794,7 @@ export class LiensinaService {
       .filter((guardian) => guardian.id === currentUser.linkedGuardianId || guardian.userId === currentUser.id)
       .map((guardian) => guardian.id))
 
-    if (roleCode === 'DIRETOR' || roleCode === 'COORDENADOR') {
+    if (roleCode === 'ADMIN_ESCOLA' || roleCode === 'DIRETOR' || roleCode === 'COORDENADOR') {
       const schoolIds = new Set(data.schools.filter((school) => currentUser.schoolId === school.id).map((school) => school.id))
       const classes = data.classes.filter((classRoom) => schoolIds.has(classRoom.schoolId))
       const classIds = new Set(classes.map((classRoom) => classRoom.id))
@@ -3072,11 +3866,126 @@ export class LiensinaService {
     }
 
     return {
-      schools: data.schools,
-      classes: data.classes,
-      teachers: teachersWithVisuals,
-      students: studentsWithVisuals,
-      guardians: guardiansWithVisuals,
+      schools: [],
+      classes: [],
+      teachers: [],
+      students: [],
+      guardians: [],
+    }
+  }
+
+  private getScopedDatabaseView(data: DatabaseShape, currentUser: UserAccount): DatabaseShape {
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
+    const schoolIds = new Set(scoped.schools.map((school) => school.id))
+    const classIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+    const studentIds = new Set(scoped.students.map((student) => student.id))
+    const evaluationIds = new Set(data.evaluations
+      .filter((evaluation) => classIds.has(evaluation.classId) || this.canAccessEvaluation(data, currentUser, evaluation))
+      .map((evaluation) => evaluation.id))
+    const canViewAllMeals = this.isSuperAdminRole(roleCode) || roleCode === 'NUTRITIONIST'
+
+    return {
+      ...data,
+      users: this.getScopedUsers(data, currentUser),
+      schools: scoped.schools,
+      classes: scoped.classes,
+      teachers: scoped.teachers,
+      students: scoped.students,
+      guardians: scoped.guardians,
+      evaluations: data.evaluations.filter((evaluation) => evaluationIds.has(evaluation.id)),
+      answerCards: data.answerCards.filter((card) => evaluationIds.has(card.evaluationId) || studentIds.has(card.studentId) || classIds.has(card.classId)),
+      evaluationCorrections: data.evaluationCorrections.filter((correction) => evaluationIds.has(correction.evaluationId) || studentIds.has(correction.studentId) || classIds.has(correction.classId)),
+      lessonRecords: data.lessonRecords.filter((record) => classIds.has(record.classId)),
+      roomReservations: data.roomReservations.filter((reservation) => classIds.has(reservation.classId)),
+      calendarEvents: data.calendarEvents.filter((event) => (
+        schoolIds.has(event.schoolId)
+        || (event.classId ? classIds.has(event.classId) : false)
+        || event.createdById === currentUser.id
+      )),
+      mealManagements: canViewAllMeals
+        ? data.mealManagements
+        : data.mealManagements.filter((management) => schoolIds.has(management.escolaId)),
+      mealFoodRequests: canViewAllMeals
+        ? data.mealFoodRequests
+        : data.mealFoodRequests.filter((request) => schoolIds.has(request.schoolId)),
+      mealRequestHistory: canViewAllMeals
+        ? data.mealRequestHistory
+        : data.mealRequestHistory.filter((history) => schoolIds.has(history.schoolId)),
+      auditEvents: this.getScopedAuditEvents(data, currentUser),
+    }
+  }
+
+  private getScopedUsers(data: DatabaseShape, currentUser: UserAccount) {
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
+    if (this.isSuperAdminRole(roleCode)) return data.users
+
+    const scoped = this.getScopedSchoolsData(data, currentUser)
+    const schoolIds = new Set(scoped.schools.map((school) => school.id))
+    const teacherIds = new Set(scoped.teachers.map((teacher) => teacher.id))
+    const studentIds = new Set(scoped.students.map((student) => student.id))
+    const guardianIds = new Set(scoped.guardians.map((guardian) => guardian.id))
+
+    return data.users.filter((user) => (
+      user.id === currentUser.id
+      || (user.schoolId ? schoolIds.has(user.schoolId) : false)
+      || (user.linkedTeacherId ? teacherIds.has(user.linkedTeacherId) : false)
+      || (user.linkedStudentId ? studentIds.has(user.linkedStudentId) : false)
+      || (user.linkedGuardianId ? guardianIds.has(user.linkedGuardianId) : false)
+    ))
+  }
+
+  private getVisibleRoles(data: DatabaseShape, currentUser: UserAccount) {
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
+    if (this.isSuperAdminRole(roleCode)) return data.roles
+    return data.roles.filter((role) => role.id === currentUser.roleId)
+  }
+
+  private getScopedAuditEvents(data: DatabaseShape, currentUser: UserAccount) {
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
+    if (this.isSuperAdminRole(roleCode)) return data.auditEvents
+    return []
+  }
+
+  private buildUserVisualIndex(users: UserAccount[]) {
+    const byId = new Map(users.map((user) => [user.id, user]))
+    const byLinkedEntityId = new Map<string, UserAccount[]>()
+    const addLinkedUser = (entityId: string | undefined, user: UserAccount) => {
+      if (!entityId) return
+      const current = byLinkedEntityId.get(entityId) ?? []
+      current.push(user)
+      byLinkedEntityId.set(entityId, current)
+    }
+
+    for (const user of users) {
+      addLinkedUser(user.linkedStudentId, user)
+      addLinkedUser(user.linkedTeacherId, user)
+      addLinkedUser(user.linkedGuardianId, user)
+    }
+
+    return { byId, byLinkedEntityId }
+  }
+
+  private withLinkedUserVisualsFromIndex<T extends { id: string; userId: string; avatarUrl?: string; bannerUrl?: string; avatarObject?: StoredImageObject | null; bannerObject?: StoredImageObject | null }>(
+    entity: T,
+    index: { byId: Map<string, UserAccount>; byLinkedEntityId: Map<string, UserAccount[]> },
+  ): T {
+    const linkedUsers = [
+      index.byId.get(entity.userId),
+      ...(index.byLinkedEntityId.get(entity.id) ?? []),
+    ].filter((user, position, users): user is UserAccount => Boolean(user) && users.findIndex((item) => item?.id === user?.id) === position)
+    const primaryUser = index.byId.get(entity.userId)
+    const userWithAvatar = linkedUsers.find((user) => user.avatarUrl || user.avatarObject)
+    const userWithBanner = linkedUsers.find((user) => user.bannerUrl || user.bannerObject)
+    const avatarSource = primaryUser?.avatarUrl || primaryUser?.avatarObject ? primaryUser : userWithAvatar
+    const bannerSource = primaryUser?.bannerUrl || primaryUser?.bannerObject ? primaryUser : userWithBanner
+
+    return {
+      ...entity,
+      avatarUrl: entity.avatarUrl || avatarSource?.avatarUrl || avatarSource?.avatarObject?.publicUrl,
+      bannerUrl: entity.bannerUrl || bannerSource?.bannerUrl || bannerSource?.bannerObject?.publicUrl,
+      avatarObject: entity.avatarObject ?? avatarSource?.avatarObject,
+      bannerObject: entity.bannerObject ?? bannerSource?.bannerObject,
     }
   }
 
@@ -3153,7 +4062,9 @@ export class LiensinaService {
   private ensureRole(data: { users: UserAccount[]; roles: Role[] }, userId: string, code: RoleCode) {
     const currentUser = this.ensureCurrentUser(data, userId)
     const role = data.roles.find((item) => item.id === currentUser.roleId)
-    if (role?.code !== code && role?.name !== code) {
+    const roleCode = role?.code ?? role?.name
+    if (code === 'ADMIN' && roleCode && this.isSuperAdminRole(roleCode)) return currentUser
+    if (roleCode !== code) {
       throw new ForbiddenException('Apenas administradores podem registrar compras da merenda.')
     }
     return currentUser
@@ -3161,14 +4072,188 @@ export class LiensinaService {
 
   private getCurrentRoleCode(data: { roles: Role[] }, currentUser: UserAccount): RoleCode {
     const role = data.roles.find((item) => item.id === currentUser.roleId)
-    return role?.code ?? role?.name ?? 'ADMIN'
+    const roleCode = role?.code ?? role?.name
+    if (!roleCode || !validRoleCodes.has(roleCode)) {
+      throw new ForbiddenException('Cargo do usuario invalido ou nao configurado.')
+    }
+    return roleCode
+  }
+
+  private isSuperAdminRole(roleCode: RoleCode) {
+    return roleCode === 'SUPERADMIN' || roleCode === 'ADMIN'
+  }
+
+  private isSchoolAdminRole(roleCode: RoleCode) {
+    return roleCode === 'ADMIN_ESCOLA'
+  }
+
+  private isSchoolManagementRole(roleCode: RoleCode) {
+    return this.isSchoolAdminRole(roleCode) || roleCode === 'DIRETOR' || roleCode === 'COORDENADOR'
+  }
+
+  private ensureGlobalAdmin(data: { users: UserAccount[]; roles: Role[] }, actorId: string) {
+    const actor = this.ensureCurrentUser(data, actorId)
+    if (!this.isSuperAdminRole(this.getCurrentRoleCode(data, actor))) {
+      throw new ForbiddenException('Sem permissao: apenas SUPERADMIN pode executar esta operacao global.')
+    }
+    return actor
+  }
+
+  private resolveRole(data: { roles: Role[] }, roleIdOrCode: string) {
+    const normalized = String(roleIdOrCode ?? '').trim()
+    const upper = normalized.toUpperCase()
+    return data.roles.find((role) => role.id === normalized || role.code === upper || role.name === upper) ?? null
+  }
+
+  private revokeRefreshSessionsForUser(data: { refreshSessions: RefreshSession[] }, userId: string) {
+    const now = new Date().toISOString()
+    for (const session of data.refreshSessions) {
+      if (session.userId === userId && !session.revokedAt) session.revokedAt = now
+    }
+  }
+
+  private revokeRefreshSessionsForRole(data: { users: UserAccount[]; refreshSessions: RefreshSession[] }, roleId: string) {
+    const userIds = new Set(data.users.filter((user) => user.roleId === roleId).map((user) => user.id))
+    const now = new Date().toISOString()
+    for (const session of data.refreshSessions) {
+      if (userIds.has(session.userId) && !session.revokedAt) session.revokedAt = now
+    }
+  }
+
+  private rejectControlledFields(payload: Record<string, unknown>, fields: string[]) {
+    const present = fields.filter((field) => Object.prototype.hasOwnProperty.call(payload, field) && payload[field] !== undefined)
+    if (present.length) throw new BadRequestException(`Campos nao permitidos: ${present.join(', ')}`)
+  }
+
+  private canCreateEvaluationRole(roleCode: RoleCode) {
+    return this.isSuperAdminRole(roleCode) || this.isSchoolAdminRole(roleCode) || roleCode === 'PROFESSOR'
+  }
+
+  private canRunOmrRole(roleCode: RoleCode) {
+    return this.isSuperAdminRole(roleCode) || this.isSchoolAdminRole(roleCode) || roleCode === 'PROFESSOR'
+  }
+
+  private canReadCorrectionCardFileRole(roleCode: RoleCode) {
+    return this.isSuperAdminRole(roleCode) || this.isSchoolManagementRole(roleCode) || roleCode === 'PROFESSOR'
+  }
+
+  private canAccessClassForMutation(data: DatabaseShape, actor: UserAccount, classRoom: ClassRoom) {
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (this.isSuperAdminRole(roleCode)) return true
+    if (this.isSchoolAdminRole(roleCode)) return Boolean(actor.schoolId) && actor.schoolId === classRoom.schoolId
+    if (roleCode !== 'PROFESSOR') return false
+    const scoped = this.getScopedSchoolsData(data, actor)
+    return scoped.classes.some((item) => item.id === classRoom.id)
+  }
+
+  private ensureStudentMutationAllowed(data: DatabaseShape, actorId: string, schoolId: string) {
+    const actor = this.ensureCurrentUser(data, actorId)
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (this.isSuperAdminRole(roleCode)) return
+    if (this.isSchoolAdminRole(roleCode) && actor.schoolId === schoolId) return
+    throw new ForbiddenException('Sem permissao para alterar dados academicos de alunos.')
+  }
+
+  private ensureCalendarEventScopeAllowed(data: DatabaseShape, actor: UserAccount, payload: Partial<SchoolCalendarEvent>) {
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (this.isSuperAdminRole(roleCode)) return
+    const scoped = this.getScopedSchoolsData(data, actor)
+    const schoolId = String(payload.schoolId ?? '').trim()
+    const classId = payload.classId ? String(payload.classId).trim() : null
+    if (!scoped.schools.some((school) => school.id === schoolId)) {
+      throw new ForbiddenException('Sem permissao para criar evento nesta escola.')
+    }
+    if (classId && !scoped.classes.some((classRoom) => classRoom.id === classId && classRoom.schoolId === schoolId)) {
+      throw new ForbiddenException('Sem permissao para criar evento nesta turma.')
+    }
+  }
+
+  private classSubjectMatchesTeacher(data: DatabaseShape, actor: UserAccount, classRoom: ClassRoom, subject: unknown) {
+    const subjectKey = this.normalizeTextKey(subject)
+    const teacherIds = new Set([actor.linkedTeacherId, ...data.teachers.filter((teacher) => teacher.userId === actor.id).map((teacher) => teacher.id)].filter(Boolean) as string[])
+    if (!teacherIds.size) return false
+    const classHasTeacher = teacherIds.has(classRoom.teacherId) || (classRoom.teacherIds ?? []).some((teacherId) => teacherIds.has(teacherId))
+    const classSubjects = (classRoom.bnccFocus ?? []).map((focus) => this.normalizeTextKey(focus))
+    const subjectMatchesClass = !subjectKey || !classSubjects.length || classSubjects.some((focus) => focus.includes(subjectKey) || subjectKey.includes(focus))
+    if (classHasTeacher && subjectMatchesClass) return true
+
+    const teachers = data.teachers.filter((teacher) => teacherIds.has(teacher.id))
+    return teachers.some((teacher) => {
+      const specialty = this.normalizeTextKey(teacher.specialty)
+      return specialty && (specialty.includes(subjectKey) || subjectKey.includes(specialty))
+    })
+  }
+
+  private createStableSubjectId(subject: unknown) {
+    const normalized = this.normalizeTextKey(subject).replace(/\s+/g, '-')
+    return `subject-${normalized || 'geral'}`
+  }
+
+  private async runIdempotentOperation<T>(
+    actorId: string,
+    schoolId: string | null | undefined,
+    operation: string,
+    resourceId: string | null | undefined,
+    payload: unknown,
+    idempotencyKey: string | undefined,
+    handler: () => Promise<T>,
+  ): Promise<T> {
+    const payloadHash = this.hashStablePayload(payload)
+    const providedKey = String(idempotencyKey ?? '').trim()
+    const key = providedKey || `auto:${this.hashStablePayload({
+      actorId,
+      schoolId: schoolId ?? null,
+      operation,
+      resourceId: resourceId ?? null,
+      payloadHash,
+    })}`
+    const scopeKey = this.hashStablePayload({
+      actorId,
+      schoolId: schoolId ?? null,
+      operation,
+      resourceId: resourceId ?? null,
+      key,
+    })
+    const reservation = await this.database.reserveIdempotencyRecord({
+      scopeKey,
+      key,
+      actorId,
+      schoolId: schoolId ?? null,
+      operation,
+      resourceId: resourceId ?? null,
+      payloadHash,
+    })
+
+    if (reservation.state === 'conflict') throw new ConflictException('Idempotency-Key reutilizada com payload diferente.')
+    if (reservation.state === 'processing') throw new ConflictException('Operacao equivalente ja esta em processamento.')
+    if (reservation.state === 'completed') return reservation.response as T
+
+    try {
+      const response = await handler()
+      await this.database.completeIdempotencyRecord(scopeKey, response)
+      return response
+    } catch (error) {
+      await this.database.failIdempotencyRecord(scopeKey, error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  }
+
+  private hashStablePayload(value: unknown) {
+    return createHash('sha256').update(this.stableJson(value)).digest('hex')
+  }
+
+  private stableJson(value: unknown): string {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value)
+    if (Array.isArray(value)) return `[${value.map((item) => this.stableJson(item)).join(',')}]`
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${this.stableJson(record[key])}`).join(',')}}`
   }
 
   private ensureCalendarEventMutationAllowed(data: { users: UserAccount[]; roles: Role[] }, actorId: string, event: SchoolCalendarEvent) {
     const currentUser = this.ensureCurrentUser(data, actorId)
     const role = data.roles.find((item) => item.id === currentUser.roleId)
     const roleCode = role?.code ?? role?.name
-    if (roleCode === 'ADMIN') return
+    if (roleCode && this.isSuperAdminRole(roleCode)) return
     if (event.createdById && event.createdById === currentUser.id) return
     throw new ForbiddenException('Apenas o criador do evento ou um Admin pode alterar este evento.')
   }
@@ -3254,10 +4339,13 @@ export class LiensinaService {
     const resources = this.normalizeBoundedText(payload.resources, 'Recursos utilizados', 2, 1000)
     const activity = this.normalizeBoundedText(payload.activity, 'Atividade realizada', 3, 2000)
     const notes = this.normalizeOptionalBoundedText(payload.notes, 'Observacoes', 1000)
+    const attendance = payload.attendance && typeof payload.attendance === 'object'
+      ? Object.fromEntries(Object.entries(payload.attendance).map(([studentId, present]) => [String(studentId), Boolean(present)]))
+      : undefined
 
     if (!data.classes.some((classRoom) => classRoom.id === classId)) throw new BadRequestException('Turma informada nao existe.')
 
-    return { id, classId, subject, date, time, content, plan, resources, activity, notes }
+    return { id, classId, subject, date, time, content, plan, resources, activity, notes, attendance }
   }
 
   private hasRoomReservationConflict(classes: ClassRoom[], reservations: RoomReservation[], reservation: RoomReservation) {
@@ -3350,11 +4438,21 @@ export class LiensinaService {
 
   private canAccessEvaluation(data: DatabaseShape, actor: UserAccount, evaluation: Evaluation) {
     const roleCode = this.getCurrentRoleCode(data, actor)
-    if (roleCode === 'ADMIN') return true
-    if (!['DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) return false
+    if (this.isSuperAdminRole(roleCode)) return true
+    if (!['ADMIN_ESCOLA', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) return false
 
     const scoped = this.getScopedSchoolsData(data, actor)
     return scoped.classes.some((classRoom) => classRoom.id === evaluation.classId)
+  }
+
+  private ensureEvaluationMutationAllowed(data: DatabaseShape, actor: UserAccount, evaluation: Evaluation) {
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (!this.canAccessEvaluation(data, actor, evaluation)) {
+      throw new ForbiddenException('Sem acesso a esta prova.')
+    }
+    if (this.isSuperAdminRole(roleCode) || this.isSchoolAdminRole(roleCode)) return
+    if (roleCode === 'PROFESSOR' && evaluation.createdById === actor.id) return
+    throw new ForbiddenException('Seu perfil nao pode alterar esta prova.')
   }
 
   private resolveEvaluationQuestions(data: DatabaseShape, evaluation: Evaluation) {
@@ -3391,17 +4489,170 @@ export class LiensinaService {
     return `${evaluation.id}:v-${hash}`
   }
 
+  private getEvaluationAnswerCardsInPrintOrder(data: DatabaseShape, evaluationId: string) {
+    return data.answerCards
+      .filter((card) => card.evaluationId === evaluationId && card.status !== 'CANCELLED')
+      .sort((first, second) => first.cardId.localeCompare(second.cardId, 'pt-BR') || first.studentName.localeCompare(second.studentName, 'pt-BR'))
+  }
+
+  private getOmrSourcePage(response: OmrServiceResponse) {
+    const metadata = response.metadata && typeof response.metadata === 'object'
+      ? response.metadata as Record<string, unknown>
+      : {}
+    const page = Number(metadata.sourcePage)
+    return Number.isFinite(page) && page > 0 ? page : null
+  }
+
+  private readQrPayloadValue(payload: Record<string, unknown> | null, keys: string[]) {
+    return this.qrCodeService.readPayloadString(payload, keys)
+  }
+
+  private normalizeOmrResponseId(value: unknown) {
+    const normalized = String(value ?? '').trim()
+    return normalized && normalized !== 'null' && normalized !== 'undefined' ? normalized : ''
+  }
+
+  private resolveOmrTargetFromResponse(
+    data: DatabaseShape,
+    evaluation: Evaluation,
+    classRoom: ClassRoom,
+    omrResponse: OmrServiceResponse,
+    options: {
+      fallbackStudent?: Student | null
+      fallbackAnswerCard?: EvaluationAnswerCard | null
+      fallbackCardId?: string | null
+      strictQrTarget?: boolean
+    } = {},
+  ): OmrResolvedTarget {
+    const qrPayload = this.qrCodeService.extractPayload(omrResponse)
+    const qrExamId = this.readQrPayloadValue(qrPayload, ['prova_id', 'examId'])
+    if (qrExamId && qrExamId !== evaluation.id) {
+      throw new BadRequestException('Cartao resposta pertence a outra prova.')
+    }
+    const qrClassId = this.readQrPayloadValue(qrPayload, ['turma_id', 'classId'])
+    if (qrClassId && qrClassId !== classRoom.id) {
+      throw new BadRequestException('Cartao resposta pertence a outra turma.')
+    }
+
+    const responseRecord = omrResponse as Record<string, unknown>
+    const answerCards = this.getEvaluationAnswerCardsInPrintOrder(data, evaluation.id)
+    const cardsByCardId = new Map(answerCards.flatMap((card) => [[card.cardId, card], [card.id, card]] as Array<[string, EvaluationAnswerCard]>))
+    const cardsByStudentId = new Map(answerCards.map((card) => [card.studentId, card]))
+
+    const payloadCardId = this.readQrPayloadValue(qrPayload, ['cartao_id', 'answerCardId', 'cardId'])
+    const payloadStudentId = this.readQrPayloadValue(qrPayload, ['aluno_id', 'studentId'])
+    const responseCardId = this.normalizeOmrResponseId(responseRecord.answerCardId)
+    const responseStudentId = this.normalizeOmrResponseId(responseRecord.studentId)
+    let cardId = payloadCardId || responseCardId || this.normalizeOmrResponseId(options.fallbackCardId)
+    let studentId = payloadStudentId || responseStudentId || this.normalizeOmrResponseId(options.fallbackStudent?.id)
+    let answerCard = (cardId && cardsByCardId.get(cardId)) || options.fallbackAnswerCard || null
+    let student = (studentId && data.students.find((item) => item.id === studentId)) || null
+
+    if (answerCard && answerCard.evaluationId !== evaluation.id) {
+      throw new BadRequestException('Cartao resposta nao pertence a esta prova.')
+    }
+    if (answerCard && answerCard.classId !== classRoom.id) {
+      throw new BadRequestException('Cartao resposta nao pertence a turma da prova.')
+    }
+
+    if (answerCard && student && answerCard.studentId !== student.id) {
+      if (options.strictQrTarget || payloadCardId || payloadStudentId || responseCardId || responseStudentId) {
+        throw new BadRequestException('Cartao resposta identifica aluno diferente do informado.')
+      }
+      student = null
+    }
+
+    if (!student && answerCard) {
+      student = data.students.find((item) => item.id === answerCard!.studentId) ?? null
+      studentId = student?.id ?? ''
+    }
+    if (!answerCard && student) {
+      answerCard = cardsByStudentId.get(student.id) ?? null
+      cardId = answerCard?.cardId ?? cardId
+    }
+    if (!student && options.fallbackStudent) {
+      student = options.fallbackStudent
+      studentId = student.id
+    }
+    if (!answerCard && options.fallbackAnswerCard) {
+      answerCard = options.fallbackAnswerCard
+      cardId = answerCard.cardId
+    }
+
+    if (!student || !studentId) throw new BadRequestException('Nao foi possivel identificar o aluno do cartao resposta.')
+    if (student.classId !== classRoom.id) throw new BadRequestException('Aluno identificado nao pertence a turma da prova.')
+
+    return {
+      student,
+      answerCard,
+      cardId: cardId || answerCard?.cardId || null,
+    }
+  }
+
   private async requestOmrCorrection(file: OmrImageFile, payload: { answerKey: EvaluationAnswerKeyItem[]; [key: string]: unknown }) {
-    const baseUrl = String(this.configService.get<string>('OMR_SERVICE_URL') ?? 'http://localhost:8000').replace(/\/+$/, '')
+    return this.requestOmrService<OmrServiceResponse>(file, payload, '/v1/omr/process', 15_000)
+  }
+
+  private async requestOmrBatchCorrection(file: OmrImageFile, payload: { answerKey: EvaluationAnswerKeyItem[]; [key: string]: unknown }) {
+    const body = await this.requestOmrService<unknown>(file, payload, '/v1/omr/process-batch', 90_000)
+    if (Array.isArray(body)) return body as OmrServiceResponse[]
+    if (body && typeof body === 'object' && Array.isArray((body as { corrections?: unknown[] }).corrections)) {
+      return (body as { corrections: OmrServiceResponse[] }).corrections
+    }
+    throw new BadRequestException('Servico OMR retornou lote em formato invalido.')
+  }
+
+  private async requestOmrService<T>(
+    file: OmrImageFile,
+    payload: { answerKey: EvaluationAnswerKeyItem[]; [key: string]: unknown },
+    endpoint: '/v1/omr/process' | '/v1/omr/process-batch',
+    defaultTimeoutMs: number,
+  ): Promise<T> {
+    if (Date.now() < this.omrCircuitOpenUntil) {
+      throw new BadRequestException('Servico OMR temporariamente indisponivel.')
+    }
+
+    const configuredBaseUrl = String(this.configService.get<string>('OMR_SERVICE_URL') ?? '').trim()
+    if (!configuredBaseUrl) throw new BadRequestException('Servico OMR nao configurado.')
+    const baseUrl = configuredBaseUrl.replace(/\/+$/, '')
+    let omrUrl: URL
+    try {
+      omrUrl = new URL(`${baseUrl}${endpoint}`)
+      if (!['http:', 'https:'].includes(omrUrl.protocol)) throw new Error('Protocolo invalido.')
+      if (process.env.NODE_ENV === 'production' && this.isBlockedRemoteHostname(omrUrl.hostname)) {
+        throw new Error('Host OMR invalido em producao.')
+      }
+    } catch {
+      throw new BadRequestException('Servico OMR configurado com URL invalida.')
+    }
+    const detected = this.detectUploadContentType(file.buffer, true)
     const formData = new FormData()
     formData.append('payload', JSON.stringify(payload))
-    formData.append('image', new Blob([new Uint8Array(file.buffer)], { type: file.mimetype || 'application/octet-stream' }), file.originalname || 'cartao-resposta.jpg')
+    formData.append('image', new Blob([new Uint8Array(file.buffer)], { type: detected.contentType }), this.safeOriginalFileName(file.originalname || `cartao-resposta.${detected.extension}`))
+    const internalToken = String(this.configService.get<string>('OMR_INTERNAL_TOKEN') ?? '').trim()
+    const timeoutMs = Math.max(1000, Math.min(120_000, Number(
+      this.configService.get<string>('OMR_REQUEST_TIMEOUT_MS')
+        ?? this.configService.get<string>('OMR_TIMEOUT_MS')
+        ?? defaultTimeoutMs,
+    ) || defaultTimeoutMs))
+    const abortController = new AbortController()
+    const timeout = setTimeout(() => abortController.abort(), timeoutMs)
 
     let response: Response
     try {
-      response = await fetch(`${baseUrl}/v1/omr/process`, { method: 'POST', body: formData })
+      response = await fetch(omrUrl, {
+        method: 'POST',
+        body: formData,
+        headers: internalToken ? { 'x-liensina-omr-token': internalToken } : undefined,
+        signal: abortController.signal,
+      })
     } catch (error) {
-      throw new BadRequestException(`Servico OMR indisponivel: ${error instanceof Error ? error.message : String(error)}`)
+      this.recordOmrFailure()
+      throw new BadRequestException(error instanceof Error && error.name === 'AbortError'
+        ? 'Servico OMR excedeu o tempo limite.'
+        : 'Servico OMR indisponivel.')
+    } finally {
+      clearTimeout(timeout)
     }
 
     const responseText = await response.text()
@@ -3413,13 +4664,27 @@ export class LiensinaService {
     }
 
     if (!response.ok) {
+      this.recordOmrFailure()
       const message = typeof body === 'object' && body && 'detail' in body
-        ? JSON.stringify((body as { detail: unknown }).detail)
-        : responseText
+        ? JSON.stringify((body as { detail: unknown }).detail).slice(0, 300)
+        : response.statusText
       throw new BadRequestException(`Servico OMR recusou a imagem: ${message}`)
     }
 
-    return body as OmrServiceResponse
+    this.resetOmrCircuit()
+    return body as T
+  }
+
+  private recordOmrFailure() {
+    this.omrFailureCount += 1
+    if (this.omrFailureCount < 3) return
+    const openMs = Math.max(1000, Math.min(5 * 60_000, Number(this.configService.get<string>('OMR_CIRCUIT_OPEN_MS') ?? 30_000) || 30_000))
+    this.omrCircuitOpenUntil = Date.now() + openMs
+  }
+
+  private resetOmrCircuit() {
+    this.omrFailureCount = 0
+    this.omrCircuitOpenUntil = 0
   }
 
   private normalizeCorrectionAnswers(value: unknown, answerKey: EvaluationAnswerKeyItem[]): EvaluationCorrectionDetectedAnswer[] {
@@ -3448,26 +4713,89 @@ export class LiensinaService {
     })
   }
 
-  private saveEvaluationCorrectionImage(evaluationId: string, studentId: string, file: OmrImageFile): StoredImageObject {
-    const extensionFromMime = file.mimetype.split('/')[1]?.replace('jpeg', 'jpg')
-    const extensionFromName = extname(file.originalname).replace(/^\./, '').toLowerCase()
-    const extension = (extensionFromMime || extensionFromName || 'jpg').replace(/[^a-z0-9]/g, '') || 'jpg'
+  private detectUploadContentType(buffer: Buffer, allowPdf: boolean) {
+    if (buffer.length < 12) throw new BadRequestException('Arquivo vazio ou invalido.')
+    const header = buffer.subarray(0, 16)
+    const prefix = header.toString('utf8').trimStart().toLowerCase()
+    if (prefix.startsWith('<svg') || prefix.startsWith('<?xml') || prefix.startsWith('<!doctype') || prefix.startsWith('<html')) {
+      throw new BadRequestException('Formato de arquivo nao permitido.')
+    }
+    if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return { contentType: 'image/jpeg', extension: 'webp' }
+    if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return { contentType: 'image/png', extension: 'webp' }
+    if (buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return { contentType: 'image/webp', extension: 'webp' }
+    if (allowPdf && buffer.subarray(0, 5).toString('ascii') === '%PDF-') return { contentType: 'application/pdf', extension: 'pdf' }
+    throw new BadRequestException('Assinatura real do arquivo nao e permitida.')
+  }
+
+  private async prepareOmrStoredFile(file: OmrImageFile): Promise<SafeStoredFile> {
+    const detected = this.detectUploadContentType(file.buffer, true)
+    if (detected.contentType === 'application/pdf') {
+      return {
+        buffer: file.buffer,
+        contentType: detected.contentType,
+        extension: detected.extension,
+        sizeBytes: file.buffer.length,
+      }
+    }
+    return this.reencodeImageFile(file, maxStoredOmrImagePixels, maxStoredOmrImageDimension)
+  }
+
+  private async reencodeImageFile(file: ProfileImageFile, maxPixels: number, maxDimension: number): Promise<SafeStoredFile> {
+    this.detectUploadContentType(file.buffer, false)
+    let metadata: sharp.Metadata
+    try {
+      metadata = await sharp(file.buffer, { limitInputPixels: maxPixels }).metadata()
+    } catch {
+      throw new BadRequestException('Imagem invalida ou corrompida.')
+    }
+    if (!metadata.width || !metadata.height) throw new BadRequestException('Imagem invalida.')
+    if ((metadata.pages ?? 1) > 1) throw new BadRequestException('Imagens animadas ou multipagina nao sao permitidas.')
+    if (metadata.width * metadata.height > maxPixels) throw new BadRequestException('Resolucao da imagem excede o limite permitido.')
+
+    try {
+      const buffer = await sharp(file.buffer, { limitInputPixels: maxPixels })
+        .rotate()
+        .resize({ width: maxDimension, height: maxDimension, fit: 'inside', withoutEnlargement: true })
+        .webp({ quality: 86, effort: 4 })
+        .toBuffer()
+      return {
+        buffer,
+        contentType: 'image/webp',
+        extension: 'webp',
+        sizeBytes: buffer.length,
+      }
+    } catch {
+      throw new BadRequestException('Nao foi possivel processar a imagem enviada.')
+    }
+  }
+
+  private safeOriginalFileName(value: unknown) {
+    const base = String(value ?? 'arquivo')
+      .replace(/[/\\]/g, '_')
+      .replace(/[^\x20-\x7E]/g, '_')
+      .replace(/["<>|:*?]/g, '_')
+      .trim()
+    return base.slice(0, 120) || 'arquivo'
+  }
+
+  private async saveEvaluationCorrectionImage(evaluationId: string, studentId: string, file: OmrImageFile): Promise<StoredImageObject> {
+    const storedFile = await this.prepareOmrStoredFile(file)
     const bucket = this.getOmrMediaBucket()
-    const key = `evaluations/${evaluationId}/students/${studentId}/${randomUUID()}.${extension}`
-    const uploadsDir = join(process.cwd(), 'uploads', bucket)
+    const key = `evaluations/${evaluationId}/students/${studentId}/${randomUUID()}.${storedFile.extension}`
+    const uploadsDir = join(process.cwd(), 'uploads', 'private', bucket)
     const filePath = join(uploadsDir, key)
 
     mkdirSync(dirname(filePath), { recursive: true })
-    writeFileSync(filePath, file.buffer)
+    writeFileSync(filePath, storedFile.buffer)
 
     return {
       storageProvider: 'local',
       bucket,
       key,
-      publicUrl: `/uploads/${bucket}/${key}`,
-      contentType: file.mimetype,
-      sizeBytes: file.size,
-      originalName: file.originalname,
+      publicUrl: '',
+      contentType: storedFile.contentType,
+      sizeBytes: storedFile.sizeBytes,
+      originalName: this.safeOriginalFileName(file.originalname),
       uploadedAt: new Date().toISOString(),
     }
   }
@@ -3581,10 +4909,18 @@ export class LiensinaService {
     if (question.visibility === 'PRIVATE') {
       return question.createdById === actor.id || question.createdById === actor.linkedTeacherId
     }
-    if (roleCode === 'ADMIN' || roleCode === 'DIRETOR' || roleCode === 'COORDENADOR') {
+    if (roleCode === 'SUPERADMIN' || roleCode === 'ADMIN' || roleCode === 'ADMIN_ESCOLA' || roleCode === 'DIRETOR' || roleCode === 'COORDENADOR') {
       return !actor.schoolId || question.schoolId === actor.schoolId
     }
     return question.schoolId === actor.schoolId || question.createdById === actor.id || question.createdById === actor.linkedTeacherId
+  }
+
+  private ensureQuestionMutationAllowed(data: DatabaseShape, actor: UserAccount, question: Question) {
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (this.isSuperAdminRole(roleCode)) return
+    if (this.isSchoolAdminRole(roleCode) && actor.schoolId && actor.schoolId === question.schoolId) return
+    if (question.createdById === actor.id || question.createdById === actor.linkedTeacherId) return
+    throw new ForbiddenException('Sem permissao para alterar esta questao.')
   }
 
   private questionMatchesSubjectFilter(question: Question, subjectFilter: string) {
@@ -3842,19 +5178,26 @@ export class LiensinaService {
   }
 
   private async fetchImageWithTimeout(url: string): Promise<DownloadedQuestionImage | null> {
+    if (!(await this.isAllowedRemoteQuestionImageUrl(url))) return null
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 30000)
+    const timeoutMs = Math.max(1000, Math.min(30_000, Number(this.configService.get<string>('REMOTE_FETCH_TIMEOUT_MS') ?? 10_000) || 10_000))
+    const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
     try {
       const response = await fetch(url, {
         headers: { Accept: 'image/*' },
+        redirect: 'manual',
         signal: controller.signal,
       })
       if (!response.ok) return null
+      const contentLength = Number(response.headers.get('content-length') ?? 0)
+      if (contentLength > maxRemoteQuestionImageBytes) return null
 
-      const arrayBuffer = await response.arrayBuffer()
-      const buffer = Buffer.from(arrayBuffer)
-      const mimeType = this.normalizeImageMimeType(response.headers.get('content-type'), url)
+      const buffer = await this.readBoundedResponse(response, maxRemoteQuestionImageBytes)
+      if (!buffer) return null
+      const detected = this.detectUploadContentType(buffer, false)
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(detected.contentType)) return null
+      const mimeType = detected.contentType
       return {
         dataUrl: `data:${mimeType};base64,${buffer.toString('base64')}`,
         mimeType,
@@ -3867,16 +5210,79 @@ export class LiensinaService {
     }
   }
 
-  private normalizeImageMimeType(contentType: string | null, url: string) {
-    const mimeType = String(contentType ?? '').split(';')[0].trim().toLowerCase()
-    if (mimeType.startsWith('image/')) return mimeType
+  private async isAllowedRemoteQuestionImageUrl(rawUrl: string) {
+    let url: URL
+    try {
+      url = new URL(rawUrl)
+    } catch {
+      return false
+    }
+    if (url.protocol !== 'https:') return false
+    if (url.username || url.password) return false
+    if (this.isBlockedRemoteHostname(url.hostname)) return false
+    const allowedHosts = String(this.configService.get<string>('ENEM_IMAGE_ALLOWED_HOSTS') ?? 'api.enem.dev,enem.dev')
+      .split(',')
+      .map((host) => host.trim().toLowerCase())
+      .filter(Boolean)
+    const hostname = url.hostname.toLowerCase()
+    if (!allowedHosts.some((host) => hostname === host || hostname.endsWith(`.${host}`))) return false
 
-    const path = url.split('?')[0].toLowerCase()
-    if (path.endsWith('.jpg') || path.endsWith('.jpeg')) return 'image/jpeg'
-    if (path.endsWith('.webp')) return 'image/webp'
-    if (path.endsWith('.gif')) return 'image/gif'
-    if (path.endsWith('.svg')) return 'image/svg+xml'
-    return 'image/png'
+    try {
+      const addresses = await lookup(hostname, { all: true, verbatim: true })
+      return addresses.length > 0 && addresses.every((address) => !this.isBlockedRemoteAddress(address.address))
+    } catch {
+      return false
+    }
+  }
+
+  private async readBoundedResponse(response: Response, maxBytes: number) {
+    if (!response.body) return null
+    const reader = response.body.getReader()
+    const chunks: Buffer[] = []
+    let received = 0
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const chunk = Buffer.from(value)
+        received += chunk.byteLength
+        if (received > maxBytes) {
+          await reader.cancel().catch(() => undefined)
+          return null
+        }
+        chunks.push(chunk)
+      }
+      return Buffer.concat(chunks, received)
+    } finally {
+      reader.releaseLock()
+    }
+  }
+
+  private isBlockedRemoteHostname(hostname: string) {
+    const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    if (normalized === 'localhost' || normalized === '0.0.0.0' || normalized === '127.0.0.1' || normalized === '::1') return true
+    if (normalized === '169.254.169.254') return true
+    if (isIP(normalized)) return this.isBlockedRemoteAddress(normalized)
+    if (normalized.endsWith('.localhost')) return true
+    return false
+  }
+
+  private isBlockedRemoteAddress(address: string): boolean {
+    const normalized = address.toLowerCase().replace(/^\[|\]$/g, '')
+    if (normalized === 'localhost' || normalized === '0.0.0.0' || normalized === '127.0.0.1' || normalized === '::1') return true
+    if (normalized === '169.254.169.254') return true
+    if (normalized.startsWith('::ffff:')) return this.isBlockedRemoteAddress(normalized.slice('::ffff:'.length))
+    if (normalized === '::' || normalized.startsWith('fe80:') || normalized.startsWith('fc') || normalized.startsWith('fd')) return true
+    const parts = normalized.split('.').map((part) => Number(part))
+    if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false
+    const [first, second] = parts
+    return first === 10
+      || first === 127
+      || first === 0
+      || (first === 169 && second === 254)
+      || (first === 172 && second >= 16 && second <= 31)
+      || (first === 192 && second === 168)
   }
 
   private async toEnemQuestionWithEmbeddedImages(apiQuestion: EnemDevQuestion, actorId: string): Promise<Question> {
@@ -4405,28 +5811,24 @@ export class LiensinaService {
     }
   }
 
-  private saveProfileImageFile(actorId: string, file: ProfileImageFile, folder: 'avatars' | 'banners'): StoredImageObject {
-    if (!file.mimetype.startsWith('image/')) throw new BadRequestException('Envie uma imagem valida para o perfil.')
-
+  private async saveProfileImageFile(actorId: string, file: ProfileImageFile, folder: 'avatars' | 'banners'): Promise<StoredImageObject> {
+    const storedFile = await this.reencodeImageFile(file, maxProfileImagePixels, maxProfileImageDimension)
     const bucket = this.getProfileMediaBucket()
-    const extensionFromMime = file.mimetype.split('/')[1]?.replace('jpeg', 'jpg')
-    const extensionFromName = extname(file.originalname).replace(/^\./, '').toLowerCase()
-    const extension = (extensionFromMime || extensionFromName || 'jpg').replace(/[^a-z0-9]/g, '')
-    const key = `profile/${folder}/${actorId}/${randomUUID()}.${extension}`
-    const uploadsDir = join(process.cwd(), 'uploads', bucket)
+    const key = `profile/${folder}/${actorId}/${randomUUID()}.${storedFile.extension}`
+    const uploadsDir = join(process.cwd(), 'uploads', 'public', bucket)
 
     const filePath = join(uploadsDir, key)
     mkdirSync(dirname(filePath), { recursive: true })
-    writeFileSync(filePath, file.buffer)
+    writeFileSync(filePath, storedFile.buffer)
 
     return {
       storageProvider: 'local',
       bucket,
       key,
       publicUrl: `/uploads/${bucket}/${key}`,
-      contentType: file.mimetype,
-      sizeBytes: file.size,
-      originalName: file.originalname,
+      contentType: storedFile.contentType,
+      sizeBytes: storedFile.sizeBytes,
+      originalName: this.safeOriginalFileName(file.originalname),
       uploadedAt: new Date().toISOString(),
     }
   }
@@ -4449,6 +5851,18 @@ export class LiensinaService {
       if (existsSync(filePath)) unlinkSync(filePath)
     } catch {
       // Removing the database reference should not fail because an old file is unavailable.
+    }
+  }
+
+  private deleteStoredLocalFile(file: StoredImageObject, visibility: 'public' | 'private') {
+    if (file.storageProvider !== 'local') return
+    const root = resolve(process.cwd(), 'uploads', visibility)
+    const filePath = resolve(root, file.bucket, file.key)
+    if (filePath !== root && !filePath.startsWith(`${root}${sep}`)) return
+    try {
+      if (existsSync(filePath)) unlinkSync(filePath)
+    } catch {
+      // Best-effort cleanup for rejected processing.
     }
   }
 
@@ -4507,7 +5921,7 @@ export class LiensinaService {
   }
 
   private toPublicUser(user: UserAccount): PublicUserAccount {
-    const { password: _password, ...publicUser } = user
+    const { password: _password, cpf: _cpf, birthDate: _birthDate, ...publicUser } = user
     return publicUser
   }
 }

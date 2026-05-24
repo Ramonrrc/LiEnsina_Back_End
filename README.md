@@ -13,7 +13,7 @@ API NestJS do LiEnsina com persistencia em PostgreSQL/SQLite e autenticacao JWT.
 
 ## Ambiente
 
-Crie um `.env` a partir de `.env.example` e troque obrigatoriamente o `JWT_SECRET` por um segredo longo e exclusivo do ambiente.
+Crie um `.env` a partir de `.env.example` e troque obrigatoriamente `JWT_ACCESS_SECRET` e `JWT_REFRESH_SECRET` por segredos longos, diferentes entre si e exclusivos do ambiente.
 
 ```bash
 npm install
@@ -37,10 +37,10 @@ Variaveis principais:
 
 1. Garanta que o backend esteja parado para congelar escritas no SQLite.
 2. Configure `.env` com `DATABASE_URL`.
-3. Rode backup:
+3. Gere snapshot local fora do Git, em storage seguro e criptografado:
 
 ```bash
-npm run db:backup:sqlite
+npm run db:snapshot:local
 ```
 
 4. Migre os dados:
@@ -63,10 +63,10 @@ npm run db:verify:postgres
 
 6. Suba a API com `DATABASE_DRIVER=postgres`.
 
-Rollback para SQLite:
+Rollback para SQLite usando um snapshot armazenado fora do repositorio:
 
 ```bash
-npm run db:rollback:sqlite -- data/backups/liensina.sqlite.backup-AAAA-MM-DDTHH-mm-ss-sssZ
+npm run db:restore:local -- caminho-seguro-fora-do-git/liensina.sqlite.backup
 ```
 
 Depois defina `DATABASE_DRIVER=sqlite` e mantenha `DATABASE_PATH` apontando para o arquivo restaurado.

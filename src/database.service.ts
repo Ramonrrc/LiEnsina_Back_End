@@ -11,7 +11,7 @@ import { Pool } from 'pg'
 import { getDatabaseConfig, type DatabaseConfig } from './database.config'
 import { databaseCollections } from './database.schema'
 import { buildQuestionBankSeed } from './question-bank.seed'
-import type { AppNotification, AssessmentDescriptor, AssessmentMatrix, AssessmentProgram, ClassRoom, CurriculumBase, CurriculumSkill, DatabaseShape, FoodRequestStatus, Guardian, LessonRecord, MealBudgetStatus, MealFood, MealFoodRequest, MealManagement, MealMenuStatus, MealRequestHistory, MealStockStatus, MealUnit, Question, QuestionImportPlan, RefreshSession, Role, RoleCode, RoomReservation, School, StoredImageObject, Student, Teacher, UserAccount } from './liensina.types'
+import type { AppNotification, AssessmentDescriptor, AssessmentMatrix, AssessmentProgram, ClassRoom, CurriculumBase, CurriculumSkill, DatabaseShape, EvaluationAnswerCard, FoodRequestStatus, Guardian, IdempotencyRecord, LessonRecord, MealBudgetStatus, MealFood, MealFoodRequest, MealManagement, MealMenuStatus, MealRequestHistory, MealStockStatus, MealUnit, Question, QuestionImportPlan, RefreshSession, Role, RoleCode, RoomReservation, School, StoredImageObject, Student, Teacher, UserAccount } from './liensina.types'
 
 const passwordHashPattern = /^\$2[aby]\$\d{2}\$/
 const passwordSaltRounds = 12
@@ -19,6 +19,17 @@ const passwordSaltRounds = 12
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 const defaultRolePermissions: Record<RoleCode, string[]> = {
+  SUPERADMIN: [
+    'food.view.all',
+    'food.request.manage.all',
+    'food.stock.manage',
+    'food.purchase.manage',
+    'food.supplier.manage',
+    'food.audit.view',
+    'user.manage',
+    'tenant.manage',
+    'audit.global',
+  ],
   ADMIN: [
     'food.view.all',
     'food.request.manage.all',
@@ -27,6 +38,11 @@ const defaultRolePermissions: Record<RoleCode, string[]> = {
     'food.supplier.manage',
     'food.audit.view',
     'user.manage',
+  ],
+  ADMIN_ESCOLA: [
+    'food.view.own_school',
+    'food.request.manage.own_school',
+    'user.manage.own_school',
   ],
   DIRETOR: [
     'food.view.own_school',
@@ -61,6 +77,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   private db?: SqlDatabase
   private pool?: Pool
   private pendingPersist: Promise<void> = Promise.resolve()
+  private revision = 0
 
   constructor(private readonly configService: ConfigService) {
     this.databaseConfig = getDatabaseConfig(this.configService)
@@ -115,7 +132,9 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
 
     this.pool = new Pool({
       connectionString: this.databaseConfig.postgresUrl,
-      ssl: this.databaseConfig.postgresSsl ? { rejectUnauthorized: false } : undefined,
+      ssl: this.databaseConfig.postgresSsl
+        ? { rejectUnauthorized: this.configService.get<string>('DATABASE_SSL_REJECT_UNAUTHORIZED') !== 'false' }
+        : undefined,
     })
 
     await this.ensurePostgresSchema()
@@ -134,10 +153,273 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     return structuredClone(this.data)
   }
 
+  readForQuery(): DatabaseShape {
+    return this.data
+  }
+
+  getRevision() {
+    return this.revision
+  }
+
   update(mutator: (data: DatabaseShape) => void): DatabaseShape {
     mutator(this.data)
+    this.revision += 1
     this.persist()
     return this.read()
+  }
+
+  async updateCommitted(mutator: (data: DatabaseShape) => void): Promise<DatabaseShape> {
+    const draft = structuredClone(this.data)
+    mutator(draft)
+
+    if (this.databaseConfig.driver === 'postgres') {
+      await this.persistPostgresNow(draft)
+      this.data = draft
+      this.revision += 1
+      return this.read()
+    }
+
+    this.data = draft
+    this.revision += 1
+    this.persist()
+    await this.pendingPersist
+    return this.read()
+  }
+
+  async reserveIdempotencyRecord(input: {
+    scopeKey: string
+    key: string
+    actorId: string
+    schoolId?: string | null
+    operation: string
+    resourceId?: string | null
+    payloadHash: string
+    ttlMs?: number
+    lockMs?: number
+  }): Promise<{ state: 'started' } | { state: 'completed'; response: unknown } | { state: 'conflict' } | { state: 'processing' }> {
+    const now = new Date()
+    const expiresAt = new Date(now.getTime() + Math.max(60_000, input.ttlMs ?? 24 * 60 * 60_000)).toISOString()
+    const lockedUntil = new Date(now.getTime() + Math.max(30_000, input.lockMs ?? 15 * 60_000)).toISOString()
+
+    if (this.pool) {
+      return this.reservePostgresIdempotencyRecord(input, expiresAt, lockedUntil)
+    }
+
+    const existing = this.data.idempotencyRecords.find((record) => record.scopeKey === input.scopeKey)
+    if (existing) {
+      if (existing.payloadHash !== input.payloadHash) return { state: 'conflict' }
+      if (existing.status === 'COMPLETED') return { state: 'completed', response: existing.response }
+      if (existing.status === 'FAILED' || existing.status === 'CANCELLED' || new Date(existing.expiresAt).getTime() <= now.getTime()) {
+        Object.assign(existing, this.createIdempotencyRecord(input, expiresAt, lockedUntil), { id: existing.id, createdAt: existing.createdAt })
+        this.revision += 1
+        this.persist()
+        return { state: 'started' }
+      }
+      return { state: 'processing' }
+    }
+
+    this.data.idempotencyRecords.push(this.createIdempotencyRecord(input, expiresAt, lockedUntil))
+    this.revision += 1
+    this.persist()
+    return { state: 'started' }
+  }
+
+  async completeIdempotencyRecord(scopeKey: string, response: unknown) {
+    const updatedAt = new Date().toISOString()
+    if (this.pool) {
+      await this.pool.query(
+        `
+          UPDATE idempotency_records_rel
+          SET status = 'COMPLETED',
+              response = $2::jsonb,
+              error_message = NULL,
+              locked_until = NULL,
+              updated_at = $3
+          WHERE scope_key = $1
+        `,
+        [scopeKey, JSON.stringify(response ?? null), updatedAt],
+      )
+    }
+
+    const record = this.data.idempotencyRecords.find((item) => item.scopeKey === scopeKey)
+    if (record) {
+      record.status = 'COMPLETED'
+      record.response = response
+      record.errorMessage = null
+      record.lockedUntil = null
+      record.updatedAt = updatedAt
+      this.revision += 1
+      this.persist()
+    }
+  }
+
+  async failIdempotencyRecord(scopeKey: string, errorMessage?: string) {
+    const updatedAt = new Date().toISOString()
+    const message = String(errorMessage ?? '').slice(0, 1000) || null
+    if (this.pool) {
+      await this.pool.query(
+        `
+          UPDATE idempotency_records_rel
+          SET status = 'FAILED',
+              error_message = $2,
+              locked_until = NULL,
+              updated_at = $3
+          WHERE scope_key = $1
+        `,
+        [scopeKey, message, updatedAt],
+      )
+    }
+
+    const record = this.data.idempotencyRecords.find((item) => item.scopeKey === scopeKey)
+    if (record) {
+      record.status = 'FAILED'
+      record.errorMessage = message
+      record.lockedUntil = null
+      record.updatedAt = updatedAt
+      this.revision += 1
+      this.persist()
+    }
+  }
+
+  private createIdempotencyRecord(input: {
+    scopeKey: string
+    key: string
+    actorId: string
+    schoolId?: string | null
+    operation: string
+    resourceId?: string | null
+    payloadHash: string
+  }, expiresAt: string, lockedUntil: string): IdempotencyRecord {
+    const now = new Date().toISOString()
+    return {
+      id: randomUUID(),
+      scopeKey: input.scopeKey,
+      key: input.key,
+      actorId: input.actorId,
+      schoolId: input.schoolId ?? null,
+      operation: input.operation,
+      resourceId: input.resourceId ?? null,
+      payloadHash: input.payloadHash,
+      status: 'PROCESSING',
+      createdAt: now,
+      updatedAt: now,
+      expiresAt,
+      lockedUntil,
+    }
+  }
+
+  private async reservePostgresIdempotencyRecord(input: {
+    scopeKey: string
+    key: string
+    actorId: string
+    schoolId?: string | null
+    operation: string
+    resourceId?: string | null
+    payloadHash: string
+  }, expiresAt: string, lockedUntil: string): Promise<{ state: 'started' } | { state: 'completed'; response: unknown } | { state: 'conflict' } | { state: 'processing' }> {
+    if (!this.pool) return { state: 'processing' }
+    await this.ensurePostgresIdempotencySchema()
+    const client = await this.pool.connect()
+
+    try {
+      await client.query('BEGIN')
+      const inserted = await client.query(
+        `
+          INSERT INTO idempotency_records_rel (
+            scope_key, key, actor_id, school_id, operation, resource_id, payload_hash,
+            status, expires_at, locked_until, created_at, updated_at
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,'PROCESSING',$8,$9,now(),now())
+          ON CONFLICT (scope_key) DO NOTHING
+          RETURNING scope_key
+        `,
+        [
+          input.scopeKey,
+          input.key,
+          input.actorId,
+          input.schoolId ?? null,
+          input.operation,
+          input.resourceId ?? null,
+          input.payloadHash,
+          expiresAt,
+          lockedUntil,
+        ],
+      )
+      if (inserted.rowCount === 1) {
+        await client.query('COMMIT')
+        return { state: 'started' }
+      }
+
+      const existing = await client.query<{
+        payload_hash: string
+        status: string
+        response: unknown
+        expires_at: Date
+      }>(
+        'SELECT payload_hash, status, response, expires_at FROM idempotency_records_rel WHERE scope_key = $1 FOR UPDATE',
+        [input.scopeKey],
+      )
+      const record = existing.rows[0]
+      if (!record) {
+        await client.query('ROLLBACK')
+        return { state: 'processing' }
+      }
+      if (record.payload_hash !== input.payloadHash) {
+        await client.query('COMMIT')
+        return { state: 'conflict' }
+      }
+      if (record.status === 'COMPLETED') {
+        await client.query('COMMIT')
+        return { state: 'completed', response: record.response }
+      }
+      if (record.status === 'FAILED' || record.status === 'CANCELLED' || new Date(record.expires_at).getTime() <= Date.now()) {
+        await client.query(
+          `
+            UPDATE idempotency_records_rel
+            SET status = 'PROCESSING',
+                error_message = NULL,
+                expires_at = $2,
+                locked_until = $3,
+                updated_at = now()
+            WHERE scope_key = $1
+          `,
+          [input.scopeKey, expiresAt, lockedUntil],
+        )
+        await client.query('COMMIT')
+        return { state: 'started' }
+      }
+
+      await client.query('COMMIT')
+      return { state: 'processing' }
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  private async ensurePostgresIdempotencySchema() {
+    await this.pool?.query(`
+      CREATE TABLE IF NOT EXISTS idempotency_records_rel (
+        scope_key text PRIMARY KEY,
+        key text NOT NULL,
+        actor_id text NOT NULL,
+        school_id text NULL,
+        operation text NOT NULL,
+        resource_id text NULL,
+        payload_hash text NOT NULL,
+        status text NOT NULL CHECK (status IN ('PROCESSING','COMPLETED','FAILED','CANCELLED')),
+        response jsonb NULL,
+        error_message text NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        expires_at timestamptz NOT NULL,
+        locked_until timestamptz NULL
+      )
+    `)
+    await this.pool?.query('CREATE INDEX IF NOT EXISTS idempotency_records_actor_operation_idx ON idempotency_records_rel(actor_id, operation, resource_id)')
+    await this.pool?.query('CREATE INDEX IF NOT EXISTS idempotency_records_expiry_idx ON idempotency_records_rel(expires_at)')
   }
 
   private ensureSchema() {
@@ -175,6 +457,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     `)
     await this.pool?.query('CREATE INDEX IF NOT EXISTS collections_updated_at_idx ON collections (updated_at)')
     await this.pool?.query('CREATE INDEX IF NOT EXISTS collections_payload_gin_idx ON collections USING gin (payload jsonb_path_ops)')
+    await this.ensurePostgresIdempotencySchema()
   }
 
   private async readPostgresCollections(): Promise<Partial<DatabaseShape>> {
@@ -215,7 +498,9 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     const rawAuditEvents = data.auditEvents ?? []
     const rawUsers = data.users ?? []
     const rawRefreshSessions = data.refreshSessions ?? []
+    const rawIdempotencyRecords = data.idempotencyRecords ?? []
     const rawNotifications = data.notifications ?? []
+    const rawAnswerCards = data.answerCards ?? []
 
     const idMaps = {
       roles: this.createUuidMap(rawRoles),
@@ -227,6 +512,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       students: this.createUuidMap(rawStudents),
       classes: this.createUuidMap(rawClasses),
       evaluations: this.createUuidMap(rawEvaluations),
+      answerCards: this.createUuidMap(rawAnswerCards),
       evaluationCorrections: this.createUuidMap(rawEvaluationCorrections),
       calendarEvents: this.createUuidMap(rawCalendarEvents),
       roomReservations: this.createUuidMap(rawRoomReservations),
@@ -234,6 +520,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       mealFoodRequests: this.createUuidMap(rawMealFoodRequests),
       mealRequestHistory: this.createUuidMap(rawMealRequestHistory),
       auditEvents: this.createUuidMap(rawAuditEvents),
+      idempotencyRecords: this.createUuidMap(rawIdempotencyRecords),
     }
 
     const roles = this.ensureBaseRoles(rawRoles.map((role) => this.normalizeRole({
@@ -354,14 +641,15 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     }
 
     const nutritionistRoleId = this.getRoleIdFromCode(roles, 'NUTRITIONIST')
-    if (nutritionistRoleId && !Array.from(usersById.values()).some((user) => user.roleId === nutritionistRoleId)) {
+    const allowDevSeeds = this.configService.get<string>('SEED_DEV_USERS') === 'true' && this.configService.get<string>('NODE_ENV') !== 'production'
+    if (allowDevSeeds && nutritionistRoleId && !Array.from(usersById.values()).some((user) => user.roleId === nutritionistRoleId)) {
       const nutritionistUserId = randomUUID()
       usersById.set(nutritionistUserId, this.normalizeUser({
         id: nutritionistUserId,
         name: 'Nutricionista da Secretaria',
         email: 'nutricionista@liensina.local',
         login: 'nutricionista@liensina.local',
-        password: 'Nutri@2026!',
+        password: randomUUID(),
         roleId: nutritionistRoleId,
         schoolId: null,
         status: 'ativo',
@@ -417,13 +705,24 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         ...evaluation,
         id: this.remapId(evaluation.id, idMaps.evaluations),
         classId: this.remapId(evaluation.classId, idMaps.classes),
+        schoolId: this.remapOptionalId(evaluation.schoolId, idMaps.schools)
+          ?? classes.find((classRoom) => classRoom.id === this.remapId(evaluation.classId, idMaps.classes))?.schoolId
+          ?? defaultSchoolId,
+        teacherId: this.remapOptionalId(evaluation.teacherId, idMaps.teachers) ?? evaluation.teacherId,
       })),
+      answerCards: this.normalizeAnswerCards(rawAnswerCards, idMaps.answerCards, idMaps.schools, idMaps.classes, idMaps.evaluations, idMaps.students, idMaps.teachers),
       evaluationCorrections: rawEvaluationCorrections.map((correction) => ({
         ...correction,
         id: this.remapId(correction.id, idMaps.evaluationCorrections),
         evaluationId: this.remapId(correction.evaluationId, idMaps.evaluations),
         classId: this.remapId(correction.classId, idMaps.classes),
         studentId: this.remapId(correction.studentId, idMaps.students),
+        schoolId: this.remapOptionalId(correction.schoolId, idMaps.schools)
+          ?? classes.find((classRoom) => classRoom.id === this.remapId(correction.classId, idMaps.classes))?.schoolId
+          ?? defaultSchoolId,
+        cardId: correction.cardId ?? null,
+        studentName: correction.studentName ?? students.find((student) => student.id === this.remapId(correction.studentId, idMaps.students))?.name,
+        subject: correction.subject ?? rawEvaluations.find((evaluation) => this.remapId(evaluation.id, idMaps.evaluations) === this.remapId(correction.evaluationId, idMaps.evaluations))?.subject,
         reviewedById: this.remapNullableId(correction.reviewedById, idMaps.users),
         createdById: this.remapOptionalId(correction.createdById, idMaps.users) ?? '',
       })),
@@ -452,6 +751,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       mealFoodRequests,
       mealRequestHistory,
       refreshSessions: this.normalizeRefreshSessions(rawRefreshSessions, normalizedUsers),
+      idempotencyRecords: this.normalizeIdempotencyRecords(rawIdempotencyRecords, idMaps.idempotencyRecords, idMaps.users, idMaps.schools),
       notifications: this.normalizeNotifications(rawNotifications, idMaps.notifications, idMaps.users, normalizedUsers),
       auditEvents: rawAuditEvents.map((auditEvent) => ({
         ...auditEvent,
@@ -572,7 +872,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
 
   private ensureBaseRoles(roles: Role[]) {
     const output = [...roles]
-    for (const code of ['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR', 'ALUNO', 'RESPONSAVEL', 'NUTRITIONIST'] as RoleCode[]) {
+    for (const code of ['SUPERADMIN', 'ADMIN_ESCOLA', 'ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR', 'ALUNO', 'RESPONSAVEL', 'NUTRITIONIST'] as RoleCode[]) {
       if (output.some((role) => role.code === code)) continue
       output.push({
         id: randomUUID(),
@@ -588,15 +888,16 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   private normalizeRoleCode(value: unknown): RoleCode {
     const code = String(value ?? '').trim().toUpperCase()
     if (code === 'NUTRICIONISTA') return 'NUTRITIONIST'
-    if (code === 'ADMIN' || code === 'DIRETOR' || code === 'COORDENADOR' || code === 'PROFESSOR' || code === 'ALUNO' || code === 'RESPONSAVEL' || code === 'NUTRITIONIST') {
+    if (code === 'SCHOOL_ADMIN') return 'ADMIN_ESCOLA'
+    if (code === 'SUPERADMIN' || code === 'ADMIN' || code === 'ADMIN_ESCOLA' || code === 'DIRETOR' || code === 'COORDENADOR' || code === 'PROFESSOR' || code === 'ALUNO' || code === 'RESPONSAVEL' || code === 'NUTRITIONIST') {
       return code
     }
-    return 'ADMIN'
+    return 'SUPERADMIN'
   }
 
   private normalizeUser(user: UserAccount, roles: Role[]): UserAccount {
     const roleId = this.normalizeRoleId(user.roleId, roles)
-    const safeRoleId = roles.some((role) => role.id === roleId) ? roleId : this.getRoleIdFromCode(roles, 'ADMIN')
+    const safeRoleId = roles.some((role) => role.id === roleId) ? roleId : this.getRoleIdFromCode(roles, 'SUPERADMIN')
 
     return {
       ...user,
@@ -682,19 +983,83 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       .filter((session) =>
         userIds.has(session.userId) &&
         passwordHashPattern.test(session.tokenHash) === false &&
-        new Date(session.expiresAt).getTime() > now &&
-        !session.revokedAt,
+        new Date(session.expiresAt).getTime() > now,
       )
       .map((session) => ({
         id: this.ensureUuid(session.id),
         userId: session.userId,
+        jti: session.jti ?? this.ensureUuid(session.id),
         tokenHash: String(session.tokenHash),
         createdAt: this.normalizeIsoDate(session.createdAt),
         expiresAt: this.normalizeIsoDate(session.expiresAt),
+        revokedAt: session.revokedAt ? this.normalizeIsoDate(session.revokedAt) : undefined,
         rotatedFromId: session.rotatedFromId,
         userAgent: session.userAgent,
         ip: session.ip,
+        ipHash: session.ipHash,
       }))
+  }
+
+  private normalizeIdempotencyRecords(
+    records: IdempotencyRecord[],
+    recordMap: Map<string, string>,
+    userMap: Map<string, string>,
+    schoolMap: Map<string, string>,
+  ): IdempotencyRecord[] {
+    const now = Date.now()
+
+    return records
+      .map((record) => {
+        const status: IdempotencyRecord['status'] = record.status === 'COMPLETED' || record.status === 'FAILED' || record.status === 'CANCELLED'
+          ? record.status
+          : 'PROCESSING'
+        const expiresAt = this.normalizeIsoDate(record.expiresAt)
+
+        return {
+          id: this.remapId(record.id, recordMap),
+          scopeKey: String(record.scopeKey ?? '').trim(),
+          key: String(record.key ?? '').trim(),
+          actorId: this.remapOptionalId(record.actorId, userMap) ?? String(record.actorId ?? '').trim(),
+          schoolId: this.remapNullableId(record.schoolId, schoolMap),
+          operation: String(record.operation ?? '').trim(),
+          resourceId: record.resourceId == null ? null : String(record.resourceId).trim() || null,
+          payloadHash: String(record.payloadHash ?? '').trim(),
+          status,
+          response: record.response,
+          errorMessage: record.errorMessage ?? null,
+          createdAt: this.normalizeIsoDate(record.createdAt),
+          updatedAt: this.normalizeIsoDate(record.updatedAt),
+          expiresAt,
+          lockedUntil: record.lockedUntil ? this.normalizeIsoDate(record.lockedUntil) : null,
+        }
+      })
+      .filter((record) => record.scopeKey && record.key && record.actorId && record.operation && record.payloadHash && new Date(record.expiresAt).getTime() > now)
+  }
+
+  private normalizeAnswerCards(
+    cards: EvaluationAnswerCard[],
+    cardMap: Map<string, string>,
+    schoolMap: Map<string, string>,
+    classMap: Map<string, string>,
+    evaluationMap: Map<string, string>,
+    studentMap: Map<string, string>,
+    teacherMap: Map<string, string>,
+  ): EvaluationAnswerCard[] {
+    return cards.map((card) => ({
+      id: this.remapId(card.id, cardMap),
+      cardId: String(card.cardId ?? '').trim() || this.createStableId('card', `${card.evaluationId}-${card.studentId}`),
+      schoolId: this.remapOptionalId(card.schoolId, schoolMap) ?? String(card.schoolId ?? '').trim(),
+      classId: this.remapOptionalId(card.classId, classMap) ?? String(card.classId ?? '').trim(),
+      subject: String(card.subject ?? '').trim(),
+      evaluationId: this.remapOptionalId(card.evaluationId, evaluationMap) ?? String(card.evaluationId ?? '').trim(),
+      studentId: this.remapOptionalId(card.studentId, studentMap) ?? String(card.studentId ?? '').trim(),
+      studentName: String(card.studentName ?? '').trim(),
+      teacherId: this.remapOptionalId(card.teacherId, teacherMap) ?? String(card.teacherId ?? '').trim(),
+      qrPayload: String(card.qrPayload ?? '').trim(),
+      status: (card.status === 'PRINTED' || card.status === 'USED' || card.status === 'CANCELLED' ? card.status : 'GENERATED') as EvaluationAnswerCard['status'],
+      createdAt: this.normalizeIsoDate(card.createdAt),
+      updatedAt: this.normalizeIsoDate(card.updatedAt),
+    })).filter((card) => card.cardId && card.schoolId && card.classId && card.evaluationId && card.studentId)
   }
 
   private normalizeNotifications(notifications: AppNotification[], notificationMap: Map<string, string>, userMap: Map<string, string>, users: UserAccount[]): AppNotification[] {
@@ -812,8 +1177,14 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         resources: String(record.resources ?? '').trim(),
         activity: String(record.activity ?? '').trim(),
         notes: String(record.notes ?? '').trim(),
+        attendance: this.normalizeAttendanceMap(record.attendance),
       }))
       .filter((record) => classIds.has(record.classId) && Boolean(record.subject || record.content))
+  }
+
+  private normalizeAttendanceMap(value: unknown): Record<string, boolean> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([, present]) => typeof present === 'boolean')) as Record<string, boolean>
   }
 
   private normalizeRoomReservations(records: Partial<RoomReservation>[], classIds: Set<string>): RoomReservation[] {
@@ -1273,13 +1644,15 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     if (!roles.length) return id
     const legacyCode = this.roleCodeFromLegacyId(id)
     if (legacyCode) return this.getRoleIdFromCode(roles, legacyCode)
-    return roles.some((role) => role.id === id) ? id : this.getRoleIdFromCode(roles, 'ADMIN')
+    return roles.some((role) => role.id === id) ? id : this.getRoleIdFromCode(roles, 'SUPERADMIN')
   }
 
   private roleCodeFromLegacyId(roleId: string): RoleCode | null {
     const legacy: Record<string, RoleCode> = {
-      'role-admin': 'ADMIN',
-      'role-secretaria': 'ADMIN',
+      'role-admin': 'SUPERADMIN',
+      'role-superadmin': 'SUPERADMIN',
+      'role-secretaria': 'ADMIN_ESCOLA',
+      'role-school-admin': 'ADMIN_ESCOLA',
       'role-diretor': 'DIRETOR',
       'role-coordenador': 'COORDENADOR',
       'role-apoio': 'COORDENADOR',
@@ -1288,10 +1661,13 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       'role-responsavel': 'RESPONSAVEL',
       'role-nutritionist': 'NUTRITIONIST',
       'role-nutricionista': 'NUTRITIONIST',
-      Secretaria: 'ADMIN',
+      Secretaria: 'ADMIN_ESCOLA',
       Diretor: 'DIRETOR',
       Professor: 'PROFESSOR',
+      SUPERADMIN: 'SUPERADMIN',
       ADMIN: 'ADMIN',
+      ADMIN_ESCOLA: 'ADMIN_ESCOLA',
+      SCHOOL_ADMIN: 'ADMIN_ESCOLA',
       DIRETOR: 'DIRETOR',
       COORDENADOR: 'COORDENADOR',
       PROFESSOR: 'PROFESSOR',
@@ -1346,7 +1722,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     if (this.db) writeFileSync(this.databasePath, Buffer.from(this.db.export()))
   }
 
-  private async persistPostgresNow() {
+  private async persistPostgresNow(data: DatabaseShape = this.data) {
     if (!this.pool) throw new Error('Pool PostgreSQL nao inicializado.')
 
     const client = await this.pool.connect()
@@ -1362,7 +1738,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
             ON CONFLICT (name)
             DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at
           `,
-          [collection, JSON.stringify(this.data[collection] ?? []), updatedAt],
+          [collection, JSON.stringify(data[collection] ?? []), updatedAt],
         )
       }
       await client.query('COMMIT')
