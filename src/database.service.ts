@@ -31,13 +31,12 @@ const defaultRolePermissions: Record<RoleCode, string[]> = {
     'audit.global',
   ],
   ADMIN: [
-    'food.view.all',
-    'food.request.manage.all',
+    'food.view.own_school',
+    'food.request.manage.own_school',
     'food.stock.manage',
     'food.purchase.manage',
     'food.supplier.manage',
-    'food.audit.view',
-    'user.manage',
+    'user.manage.own_school',
   ],
   ADMIN_ESCOLA: [
     'food.view.own_school',
@@ -67,6 +66,36 @@ const defaultRolePermissions: Record<RoleCode, string[]> = {
 const forbiddenRolePermissions: Partial<Record<RoleCode, string[]>> = {
   DIRETOR: ['auditoria:ler', 'food.audit.view'],
 }
+
+type DatabaseCollection = keyof DatabaseShape
+type DatabaseRecord = Record<string, unknown>
+
+type TenantLookup = {
+  schools: Set<string>
+  classToSchool: Map<string, string>
+  evaluationToSchool: Map<string, string>
+  studentToSchool: Map<string, string>
+  teacherToSchool: Map<string, string>
+  guardianToSchool: Map<string, string>
+  userToSchool: Map<string, string>
+}
+
+function toSnakeCase(value: string) {
+  return value.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)
+}
+
+function postgresEntityTableName(collection: DatabaseCollection) {
+  return `liensina_entity_${toSnakeCase(String(collection))}`
+}
+
+const postgresEntityTables = databaseCollections.map((collection) => ({
+  collection,
+  table: postgresEntityTableName(collection),
+}))
+const postgresEntityPersistTables = [
+  ...postgresEntityTables.filter(({ collection }) => collection === 'schools'),
+  ...postgresEntityTables.filter(({ collection }) => collection !== 'schools'),
+]
 
 @Injectable()
 export class DatabaseService implements OnModuleInit, OnModuleDestroy {
@@ -447,6 +476,14 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async ensurePostgresSchema() {
+    const schoolsTable = postgresEntityTableName('schools')
+    await this.createPostgresEntityTable(schoolsTable, schoolsTable)
+
+    for (const { collection, table } of postgresEntityTables) {
+      if (collection === 'schools') continue
+      await this.createPostgresEntityTable(table, schoolsTable)
+    }
+
     await this.pool?.query(`
       CREATE TABLE IF NOT EXISTS collections (
         name text PRIMARY KEY,
@@ -460,7 +497,62 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     await this.ensurePostgresIdempotencySchema()
   }
 
+  private async createPostgresEntityTable(table: string, schoolsTable: string) {
+    await this.pool?.query(`
+      CREATE TABLE IF NOT EXISTS ${table} (
+        id text PRIMARY KEY,
+        school_id text NULL REFERENCES ${schoolsTable}(id) ON DELETE RESTRICT,
+        class_id text NULL,
+        user_id text NULL,
+        student_id text NULL,
+        evaluation_id text NULL,
+        actor_id text NULL,
+        position integer NOT NULL DEFAULT 0,
+        payload jsonb NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT ${table}_payload_is_object CHECK (jsonb_typeof(payload) = 'object')
+      )
+    `)
+    await this.pool?.query(`CREATE INDEX IF NOT EXISTS ${table}_school_id_idx ON ${table} (school_id)`)
+    await this.pool?.query(`CREATE INDEX IF NOT EXISTS ${table}_class_id_idx ON ${table} (class_id)`)
+    await this.pool?.query(`CREATE INDEX IF NOT EXISTS ${table}_user_id_idx ON ${table} (user_id)`)
+    await this.pool?.query(`CREATE INDEX IF NOT EXISTS ${table}_student_id_idx ON ${table} (student_id)`)
+    await this.pool?.query(`CREATE INDEX IF NOT EXISTS ${table}_evaluation_id_idx ON ${table} (evaluation_id)`)
+    await this.pool?.query(`CREATE INDEX IF NOT EXISTS ${table}_updated_at_idx ON ${table} (updated_at)`)
+  }
+
   private async readPostgresCollections(): Promise<Partial<DatabaseShape>> {
+    const relationalData = await this.readPostgresEntityTables()
+    if (Object.keys(relationalData).length > 0) return relationalData
+
+    const legacyData = await this.readPostgresLegacyCollections()
+    if (Object.keys(legacyData).length > 0) {
+      this.logger.warn('Migrando armazenamento PostgreSQL legado de collections para tabelas relacionais por entidade.')
+    }
+    return legacyData
+  }
+
+  private async readPostgresEntityTables(): Promise<Partial<DatabaseShape>> {
+    const output: Partial<DatabaseShape> = {}
+    let hasRows = false
+
+    for (const { collection, table } of postgresEntityTables) {
+      const result = await this.pool?.query<{ payload: unknown }>(`
+        SELECT payload
+        FROM ${table}
+        ORDER BY position ASC, updated_at ASC, id ASC
+      `)
+      const rows = result?.rows ?? []
+      if (rows.length === 0) continue
+
+      hasRows = true
+      output[collection] = rows.map((row) => row.payload) as never
+    }
+
+    return hasRows ? output : {}
+  }
+
+  private async readPostgresLegacyCollections(): Promise<Partial<DatabaseShape>> {
     const output: Partial<DatabaseShape> = {}
     const result = await this.pool?.query<{ name: keyof DatabaseShape; payload: unknown }>('SELECT name, payload FROM collections')
 
@@ -1725,22 +1817,52 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   private async persistPostgresNow(data: DatabaseShape = this.data) {
     if (!this.pool) throw new Error('Pool PostgreSQL nao inicializado.')
 
-    const client = await this.pool.connect()
     const updatedAt = new Date()
+    const tenantLookup = this.buildTenantLookup(data)
+    this.assertTenantIntegrity(data, tenantLookup)
+    const tableList = postgresEntityTables.map(({ table }) => table).join(', ')
+    const client = await this.pool.connect()
 
     try {
       await client.query('BEGIN')
-      for (const collection of databaseCollections) {
-        await client.query(
-          `
-            INSERT INTO collections (name, payload, updated_at)
-            VALUES ($1, $2::jsonb, $3)
-            ON CONFLICT (name)
-            DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at
-          `,
-          [collection, JSON.stringify(data[collection] ?? []), updatedAt],
-        )
+      await client.query(`TRUNCATE ${tableList}`)
+
+      for (const { collection, table } of postgresEntityPersistTables) {
+        const items = (data[collection] ?? []) as unknown as DatabaseRecord[]
+        for (const [index, item] of items.entries()) {
+          await client.query(
+            `
+              INSERT INTO ${table} (
+                id,
+                school_id,
+                class_id,
+                user_id,
+                student_id,
+                evaluation_id,
+                actor_id,
+                position,
+                payload,
+                updated_at
+              )
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+            `,
+            [
+              this.extractRecordId(collection, item, index),
+              this.extractSchoolId(collection, item, tenantLookup),
+              this.extractRelationId(item, ['classId']),
+              this.extractRelationId(item, ['userId', 'requestedBy', 'reviewedBy', 'confirmedBy']),
+              this.extractRelationId(item, ['studentId']),
+              this.extractRelationId(item, ['evaluationId']),
+              this.extractRelationId(item, ['actorId', 'createdById']),
+              index,
+              JSON.stringify(item),
+              updatedAt,
+            ],
+          )
+        }
       }
+
+      await client.query('DELETE FROM collections')
       await client.query('COMMIT')
     } catch (error) {
       await client.query('ROLLBACK')
@@ -1748,5 +1870,175 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     } finally {
       client.release()
     }
+  }
+
+  private buildTenantLookup(data: DatabaseShape): TenantLookup {
+    const schools = new Set(data.schools.map((school) => String(school.id)).filter(Boolean))
+    const classToSchool = new Map<string, string>()
+    const evaluationToSchool = new Map<string, string>()
+    const studentToSchool = new Map<string, string>()
+    const teacherToSchool = new Map<string, string>()
+    const guardianToSchool = new Map<string, string>()
+    const userToSchool = new Map<string, string>()
+
+    for (const classRoom of data.classes) {
+      if (classRoom.id && classRoom.schoolId) classToSchool.set(String(classRoom.id), String(classRoom.schoolId))
+    }
+
+    for (const evaluation of data.evaluations) {
+      const schoolId = this.normalizeTenantSchoolId(evaluation.schoolId, schools)
+        ?? classToSchool.get(String(evaluation.classId))
+      if (evaluation.id && schoolId) evaluationToSchool.set(String(evaluation.id), schoolId)
+    }
+
+    for (const student of data.students) {
+      if (student.id && student.schoolId) studentToSchool.set(String(student.id), String(student.schoolId))
+    }
+
+    for (const teacher of data.teachers) {
+      if (teacher.id && teacher.schoolId) teacherToSchool.set(String(teacher.id), String(teacher.schoolId))
+    }
+
+    for (const guardian of data.guardians) {
+      if (guardian.id && guardian.schoolId) guardianToSchool.set(String(guardian.id), String(guardian.schoolId))
+    }
+
+    for (const user of data.users) {
+      const schoolId = this.normalizeTenantSchoolId(user.schoolId, schools)
+      if (user.id && schoolId) userToSchool.set(String(user.id), schoolId)
+    }
+
+    return { schools, classToSchool, evaluationToSchool, studentToSchool, teacherToSchool, guardianToSchool, userToSchool }
+  }
+
+  private assertTenantIntegrity(data: DatabaseShape, lookup: TenantLookup) {
+    for (const collection of databaseCollections) {
+      const items = (data[collection] ?? []) as unknown as DatabaseRecord[]
+      for (const [index, item] of items.entries()) {
+        const recordLabel = `${String(collection)}:${this.extractRecordId(collection, item, index)}`
+        this.assertKnownSchoolReference(collection, item, lookup, recordLabel)
+        const itemSchoolId = this.extractSchoolId(collection, item, lookup)
+
+        this.assertRelationSchools(recordLabel, itemSchoolId, item, ['classId'], lookup.classToSchool, 'turma')
+        this.assertRelationSchools(recordLabel, itemSchoolId, item, ['evaluationId'], lookup.evaluationToSchool, 'prova')
+        this.assertRelationSchools(recordLabel, itemSchoolId, item, ['studentId', 'linkedStudentId'], lookup.studentToSchool, 'aluno')
+        this.assertRelationSchools(recordLabel, itemSchoolId, item, ['teacherId', 'linkedTeacherId'], lookup.teacherToSchool, 'professor')
+        this.assertRelationSchools(recordLabel, itemSchoolId, item, ['guardianId', 'linkedGuardianId'], lookup.guardianToSchool, 'responsavel')
+        this.assertRelationSchools(
+          recordLabel,
+          itemSchoolId,
+          item,
+          ['userId', 'requestedBy', 'reviewedBy', 'confirmedBy', 'actorId', 'createdById'],
+          lookup.userToSchool,
+          'usuario',
+        )
+        this.assertRelationArrays(recordLabel, itemSchoolId, item, ['studentIds'], lookup.studentToSchool, 'aluno')
+        this.assertRelationArrays(recordLabel, itemSchoolId, item, ['teacherIds'], lookup.teacherToSchool, 'professor')
+        this.assertRelationArrays(recordLabel, itemSchoolId, item, ['guardianIds'], lookup.guardianToSchool, 'responsavel')
+      }
+    }
+  }
+
+  private assertKnownSchoolReference(collection: DatabaseCollection, item: DatabaseRecord, lookup: TenantLookup, recordLabel: string) {
+    if (collection === 'schools' || collection === 'roles') return
+    for (const field of ['schoolId', 'escolaId']) {
+      if (!Object.prototype.hasOwnProperty.call(item, field)) continue
+      const schoolId = String(item[field] ?? '').trim()
+      if (schoolId && !lookup.schools.has(schoolId)) {
+        throw new Error(`Violacao de tenant em ${recordLabel}: ${field} aponta para escola inexistente.`)
+      }
+    }
+  }
+
+  private assertRelationSchools(
+    recordLabel: string,
+    itemSchoolId: string | null,
+    item: DatabaseRecord,
+    fields: string[],
+    relationToSchool: Map<string, string>,
+    relationLabel: string,
+  ) {
+    for (const field of fields) {
+      const relationId = String(item[field] ?? '').trim()
+      if (!relationId) continue
+      this.assertRelationSchool(recordLabel, itemSchoolId, relationId, relationToSchool, relationLabel)
+    }
+  }
+
+  private assertRelationArrays(
+    recordLabel: string,
+    itemSchoolId: string | null,
+    item: DatabaseRecord,
+    fields: string[],
+    relationToSchool: Map<string, string>,
+    relationLabel: string,
+  ) {
+    for (const field of fields) {
+      const values = Array.isArray(item[field]) ? item[field] as unknown[] : []
+      for (const value of values) {
+        const relationId = String(value ?? '').trim()
+        if (!relationId) continue
+        this.assertRelationSchool(recordLabel, itemSchoolId, relationId, relationToSchool, relationLabel)
+      }
+    }
+  }
+
+  private assertRelationSchool(
+    recordLabel: string,
+    itemSchoolId: string | null,
+    relationId: string,
+    relationToSchool: Map<string, string>,
+    relationLabel: string,
+  ) {
+    const relationSchoolId = relationToSchool.get(relationId)
+    if (!relationSchoolId || !itemSchoolId || relationSchoolId === itemSchoolId) return
+    throw new Error(`Violacao de tenant em ${recordLabel}: ${relationLabel} pertence a outra escola.`)
+  }
+
+  private extractRecordId(collection: DatabaseCollection, item: DatabaseRecord, index: number) {
+    const id = String(item.id ?? '').trim()
+    return id || `${String(collection)}:${index}`
+  }
+
+  private extractSchoolId(collection: DatabaseCollection, item: DatabaseRecord, lookup: TenantLookup) {
+    if (collection === 'schools' || collection === 'roles') return null
+
+    const directSchoolId = this.normalizeTenantSchoolId(item.schoolId, lookup.schools)
+      ?? this.normalizeTenantSchoolId(item.escolaId, lookup.schools)
+    if (directSchoolId) return directSchoolId
+
+    const classId = this.extractRelationId(item, ['classId'])
+    if (classId && lookup.classToSchool.has(classId)) return lookup.classToSchool.get(classId) ?? null
+
+    const evaluationId = this.extractRelationId(item, ['evaluationId'])
+    if (evaluationId && lookup.evaluationToSchool.has(evaluationId)) return lookup.evaluationToSchool.get(evaluationId) ?? null
+
+    const studentId = this.extractRelationId(item, ['studentId'])
+    if (studentId && lookup.studentToSchool.has(studentId)) return lookup.studentToSchool.get(studentId) ?? null
+
+    const teacherId = this.extractRelationId(item, ['teacherId'])
+    if (teacherId && lookup.teacherToSchool.has(teacherId)) return lookup.teacherToSchool.get(teacherId) ?? null
+
+    const guardianId = this.extractRelationId(item, ['guardianId'])
+    if (guardianId && lookup.guardianToSchool.has(guardianId)) return lookup.guardianToSchool.get(guardianId) ?? null
+
+    const userId = this.extractRelationId(item, ['userId', 'requestedBy', 'reviewedBy', 'confirmedBy', 'actorId', 'createdById'])
+    if (userId && lookup.userToSchool.has(userId)) return lookup.userToSchool.get(userId) ?? null
+
+    return null
+  }
+
+  private normalizeTenantSchoolId(value: unknown, schools: Set<string>) {
+    const schoolId = String(value ?? '').trim()
+    if (!schoolId || !schools.has(schoolId)) return null
+    return schoolId
+  }
+
+  private extractRelationId(item: DatabaseRecord, fields: string[]) {
+    for (const field of fields) {
+      const value = String(item[field] ?? '').trim()
+      if (value) return value
+    }
+    return null
   }
 }

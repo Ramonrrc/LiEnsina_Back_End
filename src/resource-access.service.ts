@@ -107,7 +107,7 @@ type ScopedResourceSet = {
 
 const roleSections: Record<RoleCode, string[]> = {
   SUPERADMIN: ['dashboard', 'schools', 'people', 'evaluations', 'evaluation-corrections', 'meals', 'access', 'notifications', 'settings'],
-  ADMIN: ['dashboard', 'schools', 'people', 'evaluations', 'evaluation-corrections', 'meals', 'access', 'notifications', 'settings'],
+  ADMIN: ['dashboard', 'schools', 'people', 'evaluations', 'evaluation-corrections', 'meals', 'notifications', 'settings'],
   ADMIN_ESCOLA: ['dashboard', 'schools', 'people', 'evaluations', 'evaluation-corrections', 'meals', 'notifications', 'settings'],
   DIRETOR: ['dashboard', 'schools', 'people', 'evaluations', 'evaluation-corrections', 'meals', 'notifications', 'settings'],
   COORDENADOR: ['pedagogy', 'evaluations', 'evaluation-corrections', 'calendar', 'notifications', 'settings'],
@@ -129,7 +129,7 @@ const roleActions: Record<RoleCode, string[]> = {
     'audit:read:global',
   ],
   ADMIN: [
-    'schools:read', 'schools:write', 'users:read', 'users:write', 'students:read', 'students:write',
+    'schools:read', 'users:read', 'users:write:own_school', 'students:read', 'students:write',
     'teachers:read', 'teachers:write', 'classes:read', 'classes:write', 'subjects:read',
     'teacher-assignments:read', 'teacher-assignments:write', 'exams:read', 'exams:write',
     'exam-corrections:read', 'exam-corrections:write', 'grades:read', 'grades:write',
@@ -178,11 +178,11 @@ const roleActions: Record<RoleCode, string[]> = {
 }
 
 function isSuperAdminRole(roleCode: RoleCode) {
-  return roleCode === 'SUPERADMIN' || roleCode === 'ADMIN'
+  return roleCode === 'SUPERADMIN'
 }
 
 function isSchoolAdminRole(roleCode: RoleCode) {
-  return roleCode === 'ADMIN_ESCOLA'
+  return roleCode === 'ADMIN_ESCOLA' || roleCode === 'ADMIN'
 }
 
 function isSchoolManagementRole(roleCode: RoleCode) {
@@ -396,7 +396,7 @@ export class ResourceAccessService {
     }
     const subjectFilter = this.cleanFilter(query.subject ?? query.subjectId)
     if (subjectFilter) classes = classes.filter((classRoom) => this.classAllowsSubject(classRoom, subjectFilter))
-    classes = this.searchItems(classes, query.search, (classRoom) => `${classRoom.name} ${classRoom.grade} ${classRoom.shift}`)
+    classes = this.searchItems(classes, query.search, (classRoom) => classRoom.name)
     return this.page('classes', classes.map((classRoom) => this.classDto(classRoom, roleCode)), query)
   }
 

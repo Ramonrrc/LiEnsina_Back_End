@@ -24,12 +24,14 @@ A API sobe em `http://localhost:3001/api`.
 
 ## Banco
 
-O runtime atual usa a tabela `collections`. No SQLite antigo, `payload` era `TEXT` com JSON; no PostgreSQL, `payload` passa a ser `jsonb`, com `name` como chave primaria e validacao para garantir arrays JSON.
+Em PostgreSQL, o runtime persiste cada colecao em tabelas relacionais por entidade, como `liensina_entity_students`, `liensina_entity_evaluations` e `liensina_entity_schools`. Essas tabelas possuem `id` como chave primaria, `school_id` indexado quando aplicavel e FK para escolas, mantendo o payload JSONB por registro para compatibilidade durante a migracao.
+
+No SQLite local legado, a API ainda usa a tabela `collections` como armazenamento de desenvolvimento/rollback.
 
 Variaveis principais:
 
 - `DATABASE_DRIVER=postgres` para PostgreSQL, `sqlite` para rollback local.
-- `DATABASE_URL=postgresql://usuario:senha@host:5432/banco`.
+- `DATABASE_URL` com a string de conexao privada do PostgreSQL, definida apenas na `.env` local/servidor.
 - `DATABASE_SSL=true` ou `require` para Neon.
 - `DATABASE_PATH=data/liensina.sqlite` para o SQLite legado.
 
@@ -66,7 +68,7 @@ npm run db:verify:postgres
 Rollback para SQLite usando um snapshot armazenado fora do repositorio:
 
 ```bash
-npm run db:restore:local -- caminho-seguro-fora-do-git/liensina.sqlite.backup
+npm run db:restore:local -- caminho-seguro-fora-do-git/snapshot-local
 ```
 
 Depois defina `DATABASE_DRIVER=sqlite` e mantenha `DATABASE_PATH` apontando para o arquivo restaurado.

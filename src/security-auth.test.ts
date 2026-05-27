@@ -5,6 +5,7 @@ import { plainToInstance } from 'class-transformer'
 import { validateSync } from 'class-validator'
 
 import { AuthGuard } from './auth.guard'
+import { DatabaseService } from './database.service'
 import { validateAppEnv } from './env.validation'
 import { LiensinaService } from './liensina.service'
 import { CreateLessonRecordDto, CreateMealItemDto, CreateMealManagementDto, CreateQuestionDto, CreateTeacherDto, GenerateQuestionSelectionDto, QuestionBankPageQueryDto, UpdateStudentDto } from './resource-query.dto'
@@ -58,9 +59,9 @@ function role(code: RoleCode) {
 
 function makeDatabase(): DatabaseShape {
   return {
-    roles: ['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR', 'ALUNO', 'RESPONSAVEL', 'NUTRITIONIST'].map((code) => role(code as RoleCode)),
+    roles: ['SUPERADMIN', 'ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR', 'ALUNO', 'RESPONSAVEL', 'NUTRITIONIST'].map((code) => role(code as RoleCode)),
     users: [
-      { id: 'admin-user', name: 'Admin', email: 'admin@local.test', login: 'admin@local.test', password: 'StrongPass123!', roleId: 'ADMIN', schoolId: null, status: 'ativo', phone: '' },
+      { id: 'admin-user', name: 'Admin', email: 'admin@local.test', login: 'admin@local.test', password: 'StrongPass123!', roleId: 'SUPERADMIN', schoolId: null, status: 'ativo', phone: '' },
       { id: 'other-user', name: 'Other', email: 'other@local.test', login: 'other@local.test', password: 'StrongPass123!', roleId: 'ALUNO', schoolId: null, status: 'ativo', phone: '' },
     ],
     refreshSessions: [],
@@ -121,6 +122,11 @@ function validationMessages(dto: new () => object, payload: unknown) {
       ...((child.children ?? []).flatMap((grandChild) => Object.values(grandChild.constraints ?? {}))),
     ])),
   ])
+}
+
+type TenantIntegrityHarness = {
+  buildTenantLookup(data: DatabaseShape): unknown
+  assertTenantIntegrity(data: DatabaseShape, lookup: unknown): void
 }
 
 describe('Security env validation', () => {
@@ -260,6 +266,46 @@ describe('JWT refresh sessions', () => {
     liensina.updateUserRole('admin-user', 'other-user', 'PROFESSOR')
 
     await assert.rejects(() => liensina.refreshLogin(login.refreshToken), /revogado|invalido|reutilizado/i)
+  })
+})
+
+describe('PostgreSQL tenant integrity', () => {
+  it('bloqueia persistencia relacional com vinculo cruzado entre escolas', () => {
+    const data = makeDatabase()
+    data.schools.push(
+      { id: 'school-a', name: 'Escola A', city: 'A', address: 'Rua A', director: 'Diretor A', inepCode: '111', active: true },
+      { id: 'school-b', name: 'Escola B', city: 'B', address: 'Rua B', director: 'Diretor B', inepCode: '222', active: true },
+    )
+    data.classes.push(
+      { id: 'class-a', name: 'Turma A', grade: 'EF6', shift: 'Manha', schoolId: 'school-a', teacherIds: [], academicYear: 2026, schedule: '', bnccFocus: [] } as never,
+      { id: 'class-b', name: 'Turma B', grade: 'EF6', shift: 'Manha', schoolId: 'school-b', teacherIds: [], academicYear: 2026, schedule: '', bnccFocus: [] } as never,
+    )
+    data.students.push({
+      id: 'student-b',
+      name: 'Aluno B',
+      login: 'student-b',
+      role: 'ALUNO',
+      registration: 'B1',
+      registrationNumber: 'B1',
+      schoolId: 'school-b',
+      classId: 'class-b',
+      guardianIds: [],
+      status: 'matriculado',
+      attendanceRate: 100,
+      averageScore: 0,
+      desempenho: 'Neutro',
+    } as never)
+    data.answerCards.push({
+      id: 'card-cross-tenant',
+      schoolId: 'school-a',
+      classId: 'class-a',
+      studentId: 'student-b',
+    } as never)
+
+    const database = new DatabaseService(new MemoryConfig({}) as never) as unknown as TenantIntegrityHarness
+    const lookup = database.buildTenantLookup(data)
+
+    assert.throws(() => database.assertTenantIntegrity(data, lookup), /Violacao de tenant/)
   })
 })
 

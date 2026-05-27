@@ -27,7 +27,7 @@ Isso preserva dados, autenticacao, permissoes, relacionamentos por ids, timestam
 
 ```env
 DATABASE_DRIVER=postgres
-DATABASE_URL=postgresql://liensina:senha@localhost:5432/liensina
+DATABASE_URL=defina_a_string_privada_no_env_local
 DATABASE_SSL=false
 DATABASE_PATH=data/liensina.sqlite
 SQLITE_SOURCE_PATH=data/liensina.sqlite
@@ -36,16 +36,16 @@ SQLITE_SOURCE_PATH=data/liensina.sqlite
 Para Neon:
 
 ```env
-DATABASE_URL=postgresql://usuario:senha@ep-xxxx.us-east-2.aws.neon.tech/liensina?sslmode=require
+DATABASE_URL=defina_a_string_privada_do_neon_no_env_local
 DATABASE_SSL=true
 ```
 
 ## Comandos completos
 
-Backup:
+Snapshot local fora do Git:
 
 ```bash
-npm run db:backup:sqlite
+npm run db:snapshot:local
 ```
 
 Migracao:
@@ -83,10 +83,10 @@ npm run db:migrate:postgres
 
 ## Rollback
 
-O SQLite original e preservado e um backup datado e criado em `data/backups`.
+O SQLite original deve ser preservado somente em um local seguro fora do repositorio.
 
 ```bash
-npm run db:rollback:sqlite -- data/backups/liensina.sqlite.backup-AAAA-MM-DDTHH-mm-ss-sssZ
+npm run db:restore:local -- caminho-seguro-fora-do-git/snapshot-local
 ```
 
 Depois defina:
@@ -102,12 +102,12 @@ DATABASE_PATH=data/liensina.sqlite
 - PostgreSQL com dados antigos: o script exige `POSTGRES_MIGRATION_OVERWRITE=true`.
 - Neon exige SSL: use `DATABASE_SSL=true` ou `sslmode=require` na URL.
 - Normalizacao relacional futura: faca por dominio, com migrations versionadas e testes de integridade, porque o SQLite atual nao possui foreign keys fisicas para converter automaticamente.
-- Dados sensiveis: `.env`, SQLite, backups e credenciais estao ignorados por Git/Docker.
+- Dados sensiveis: `.env`, SQLite, snapshots e credenciais estao ignorados por Git/Docker.
 
 ## Estrategia futura recomendada
 
 1. Manter esta migracao como etapa de compatibilidade segura.
-2. Criar migrations versionadas por dominio: `users`, `roles`, `schools`, `classes`, `students`, `guardians`, `teachers`, `refresh_sessions`, etc.
-3. Migrar uma colecao por vez para tabelas relacionais com foreign keys reais.
+2. Evoluir as tabelas `liensina_entity_*` por dominio, adicionando colunas materiais quando necessario.
+3. Substituir gradualmente leituras em memoria por repositories com filtros obrigatorios de tenant.
 4. Executar validadores comparando JSON legado versus tabelas novas.
 5. Remover o modo SQLite apenas depois de um ciclo completo de backup, migracao, smoke tests e rollback ensaiado.

@@ -4080,11 +4080,11 @@ export class LiensinaService {
   }
 
   private isSuperAdminRole(roleCode: RoleCode) {
-    return roleCode === 'SUPERADMIN' || roleCode === 'ADMIN'
+    return roleCode === 'SUPERADMIN'
   }
 
   private isSchoolAdminRole(roleCode: RoleCode) {
-    return roleCode === 'ADMIN_ESCOLA'
+    return roleCode === 'ADMIN_ESCOLA' || roleCode === 'ADMIN'
   }
 
   private isSchoolManagementRole(roleCode: RoleCode) {

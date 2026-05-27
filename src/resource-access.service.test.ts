@@ -118,6 +118,7 @@ function makeDatabase(): DatabaseShape {
   return {
     roles,
     users: [
+      { id: 'superadmin-user', name: 'Superadmin', email: 'superadmin@local', login: 'superadmin@local', password: 'secret', roleId: 'SUPERADMIN', schoolId: null, status: 'ativo', phone: '' },
       { id: 'admin-user', name: 'Admin', email: 'admin@local', login: 'admin@local', password: 'secret', roleId: 'ADMIN', schoolId: null, status: 'ativo', phone: '' },
       { id: 'school-admin-user-a', name: 'Admin Escola A', email: 'admin.a@local', login: 'admin.a@local', password: 'secret', roleId: 'ADMIN_ESCOLA', schoolId: 'school-a', status: 'ativo', phone: '' },
       { id: 'school-admin-user-b', name: 'Admin Escola B', email: 'admin.b@local', login: 'admin.b@local', password: 'secret', roleId: 'ADMIN_ESCOLA', schoolId: 'school-b', status: 'ativo', phone: '' },
@@ -199,6 +200,15 @@ describe('ResourceAccessService RBAC/ABAC', () => {
     assert.deepEqual(access.listTeachers('director-user-a').teachers.map((teacher) => teacher.id), ['teacher-a'])
     assert.deepEqual(access.listExams('director-user-a').exams.map((exam) => exam.id), ['exam-a'])
     assert.throws(() => access.getStudent('director-user-a', 'student-b'), /Sem permissao|nao encontrado/)
+  })
+
+  it('lista turmas paginadas no backend e busca apenas pelo nome da turma', () => {
+    const { access } = services()
+
+    const page = access.listClasses('director-user-a', { page: 1, limit: 1, search: 'Turma A' })
+    assert.deepEqual(page.classes.map((classRoom) => classRoom.id), ['class-a'])
+    assert.equal(page.pagination.total, 1)
+    assert.deepEqual(access.listClasses('director-user-a', { search: 'EF6' }).classes, [])
   })
 
   it('coordenador ve metricas da propria escola, mas nao edita aluno nem gera prova', async () => {
@@ -360,13 +370,24 @@ describe('ResourceAccessService RBAC/ABAC', () => {
     assert.throws(() => access.createManualCorrection('guardian-user-a', { evaluationId: 'exam-a', studentId: 'student-a', finalScore: 10 }), /permissao/)
   })
 
-  it('admin acessa dados globais pelos endpoints REST organizados', () => {
+  it('superadmin acessa dados globais pelos endpoints REST organizados', () => {
     const { access } = services()
 
-    assert.equal(access.listStudents('admin-user').students.length, 2)
-    assert.equal(access.listTeachers('admin-user').teachers.length, 2)
-    assert.equal(access.listExams('admin-user').exams.length, 2)
-    assert.equal(access.listSchools('admin-user').schools.length, 2)
+    assert.equal(access.listStudents('superadmin-user').students.length, 2)
+    assert.equal(access.listTeachers('superadmin-user').teachers.length, 2)
+    assert.equal(access.listExams('superadmin-user').exams.length, 2)
+    assert.equal(access.listSchools('superadmin-user').schools.length, 2)
+  })
+
+  it('admin sem escola nao herda acesso global de superadmin', () => {
+    const { access, liensina } = services()
+
+    assert.deepEqual(access.listStudents('admin-user').students, [])
+    assert.deepEqual(access.listTeachers('admin-user').teachers, [])
+    assert.deepEqual(access.listExams('admin-user').exams, [])
+    assert.deepEqual(access.listSchools('admin-user').schools, [])
+    assert.deepEqual(access.listRoles('admin-user').roles.map((item) => item.code), ['ADMIN'])
+    assert.throws(() => liensina.updateUserRole('admin-user', 'student-user-a', 'SUPERADMIN'), /permissao/)
   })
 
   it('admin escolar fica limitado a propria escola e nao executa rotas globais', () => {
