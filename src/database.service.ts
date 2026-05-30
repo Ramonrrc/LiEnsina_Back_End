@@ -1944,10 +1944,24 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     for (const field of ['schoolId', 'escolaId']) {
       if (!Object.prototype.hasOwnProperty.call(item, field)) continue
       const schoolId = String(item[field] ?? '').trim()
+      if (collection === 'questions' && this.isGlobalQuestionTenantPlaceholder(item, schoolId)) continue
       if (schoolId && !lookup.schools.has(schoolId)) {
         throw new Error(`Violacao de tenant em ${recordLabel}: ${field} aponta para escola inexistente.`)
       }
     }
+  }
+
+  private isGlobalQuestionTenantPlaceholder(item: DatabaseRecord, schoolId: string) {
+    if (schoolId !== 'global-school') return false
+    const visibility = String(item.visibility ?? '').trim().toUpperCase()
+    const sourceType = String(item.sourceType ?? '').trim().toUpperCase()
+
+    return (
+      visibility === 'GLOBAL'
+      || visibility === 'NETWORK'
+      || sourceType === 'GLOBAL_CURATED'
+      || sourceType === 'INEP_ENEM'
+    )
   }
 
   private assertRelationSchools(

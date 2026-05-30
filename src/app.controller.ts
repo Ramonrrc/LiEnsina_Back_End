@@ -176,9 +176,42 @@ export class AppController {
   }
 
   @UseGuards(AuthGuard)
+  @Get('me/exams/:id/download')
+  async downloadMyEvaluation(
+    @Req() request: RequestWithUser,
+    @Param('id') id: string,
+    @Query('kind') kind = 'complete',
+    @Query('type') type = '',
+    @Res() response: Response,
+  ) {
+    const file = await this.liensinaService.getStudentEvaluationDownload(request.user!.id, id, type || kind)
+    response.setHeader('Content-Type', file.contentType)
+    response.setHeader('Content-Disposition', this.contentDispositionAttachment(file.filename))
+    response.setHeader('Cache-Control', 'no-store')
+    return response.sendFile(file.filePath)
+  }
+
+  @UseGuards(AuthGuard)
   @Get('me/exam-corrections')
   listMyExamCorrections(@Req() request: RequestWithUser, @Query() query: ResourceListQueryDto) {
     return this.resourceAccessService.listExamCorrections(request.user!.id, query)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('me/exam-corrections/:id')
+  getMyExamCorrection(@Req() request: RequestWithUser, @Param('id') id: string) {
+    return this.resourceAccessService.getExamCorrection(request.user!.id, id)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('me/exam-corrections/:id/image')
+  downloadMyEvaluationCorrectionImage(@Req() request: RequestWithUser, @Param('id') id: string, @Res() response: Response) {
+    const file = this.liensinaService.getStudentEvaluationCorrectionCardFile(request.user!.id, id)
+    response.setHeader('Content-Type', file.contentType)
+    response.setHeader('Content-Disposition', this.contentDispositionAttachment(file.filename))
+    response.setHeader('Cache-Control', 'no-store')
+    response.setHeader('X-Content-Type-Options', 'nosniff')
+    return response.sendFile(file.filePath)
   }
 
   @UseGuards(AuthGuard)
@@ -191,6 +224,17 @@ export class AppController {
   @Get('me/grades')
   listMyGrades(@Req() request: RequestWithUser, @Query() query: ResourceListQueryDto) {
     return this.resourceAccessService.listGrades(request.user!.id, query)
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('me/student-subjects')
+  listMyStudentSubjects(
+    @Req() request: RequestWithUser,
+    @Query('page') page = '1',
+    @Query('limit') limit = '6',
+    @Query('search') search = '',
+  ) {
+    return this.liensinaService.listStudentSubjectCardsPage(request.user!.id, page, limit, search)
   }
 
   @UseGuards(AuthGuard)

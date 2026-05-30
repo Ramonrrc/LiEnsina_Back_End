@@ -100,8 +100,18 @@ function correction(id: string, evaluationId: string, studentId: string, classId
     requiresReview: false,
     shouldRetakeImage: false,
     failures: [],
-    detectedAnswers: [],
-    answerKey: [],
+    detectedAnswers: [{
+      questionNumber: 1,
+      questionId: 'question-a',
+      detectedOption: 'A',
+      correctOption: 'A',
+      isCorrect: true,
+      status: 'ok',
+      confidence: 0.98,
+      markedOptions: ['A'],
+      optionScores: [{ option: 'A', fillRatio: 0.9 }],
+    }],
+    answerKey: [{ questionNumber: 1, questionId: 'question-a', correctOption: 'A' }],
     rawOmrResponse: {},
     teacherNotes: null,
     reviewedById: 'teacher-user-a',
@@ -239,6 +249,126 @@ describe('ResourceAccessService RBAC/ABAC', () => {
     assert.deepEqual(page.subjectCards[0].classes.map((classRoom) => classRoom.id), ['class-a'])
   })
 
+  it('endpoint de minhas materias do aluno pagina e busca no banco sem vazar outra escola', () => {
+    const data = makeDatabase()
+    const classA = data.classes.find((classRoom) => classRoom.id === 'class-a')
+    if (!classA) throw new Error('Fixture invalida.')
+    classA.bnccFocus = ['Matematica', 'Lingua Portuguesa', 'Historia', 'Geografia', 'Ciencias', 'Arte', 'Ingles']
+    data.evaluations.push({
+      id: 'exam-arte-a',
+      title: 'Prova de Arte',
+      schoolId: 'school-a',
+      teacherId: 'teacher-a',
+      createdById: 'teacher-user-a',
+      classId: 'class-a',
+      subject: 'Arte',
+      questions: 10,
+      scheduledAt: '2026-05-02',
+      status: 'concluido',
+      corrected: 1,
+      participants: 1,
+      averageScore: 9,
+      triLevel: 'A',
+    })
+    data.evaluationCorrections.push({
+      ...correction('grade-arte-a', 'exam-arte-a', 'student-a', 'class-a', 'school-a'),
+      subject: 'Arte',
+      finalScore: 9,
+    })
+    const liensina = new LiensinaService(new MemoryDatabase(data) as never, {} as never, { get: () => undefined } as never)
+
+    const firstPage = liensina.listStudentSubjectCardsPage('student-user-a', 1, 6)
+    assert.equal(firstPage.subjectCards.length, 6)
+    assert.equal(firstPage.pagination.total, 7)
+    assert.equal(firstPage.pagination.totalPages, 2)
+
+    const searchPage = liensina.listStudentSubjectCardsPage('student-user-a', 1, 6, 'arte')
+    assert.deepEqual(searchPage.subjectCards.map((card) => card.subject), ['Arte'])
+    assert.equal(searchPage.subjectCards[0].gradesCount, 1)
+    assert.equal(searchPage.subjectCards[0].latestScore, 9)
+
+    const otherSchoolSearch = liensina.listStudentSubjectCardsPage('student-user-b', 1, 6, 'matematica')
+    assert.deepEqual(otherSchoolSearch.subjectCards, [])
+    assert.throws(() => liensina.listStudentSubjectCardsPage('teacher-user-a', 1, 6), /Endpoint exclusivo/)
+  })
+
+  it('endpoint de minhas materias consolida habilidades BNCC da mesma disciplina', () => {
+    const data = makeDatabase()
+    const classA = data.classes.find((classRoom) => classRoom.id === 'class-a')
+    if (!classA) throw new Error('Fixture invalida.')
+    classA.bnccFocus = ['EF06CI01', 'EF06CI02', 'Ciencias', 'Matematica']
+    data.curriculumSkills.push(
+      {
+        id: 'skill-ciencias-1',
+        baseId: 'bncc',
+        code: 'EF06CI01',
+        description: 'Investigar caracteristicas de materiais.',
+        stage: 'FUNDAMENTAL',
+        gradeLevel: 'EF6',
+        area: 'Ciencias da Natureza',
+        component: 'Ciencias',
+        thematicUnit: 'Materia e energia',
+        knowledgeObject: 'Materiais',
+        competence: null,
+        sourceUrl: null,
+        active: true,
+        metadata: {},
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+      {
+        id: 'skill-ciencias-2',
+        baseId: 'bncc',
+        code: 'EF06CI02',
+        description: 'Classificar misturas.',
+        stage: 'FUNDAMENTAL',
+        gradeLevel: 'EF6',
+        area: 'Ciencias da Natureza',
+        component: 'Ciencias',
+        thematicUnit: 'Materia e energia',
+        knowledgeObject: 'Misturas',
+        competence: null,
+        sourceUrl: null,
+        active: true,
+        metadata: {},
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    )
+    data.evaluations.push({
+      id: 'exam-ciencias-a',
+      title: 'Prova de Ciencias',
+      schoolId: 'school-a',
+      teacherId: 'teacher-a',
+      createdById: 'teacher-user-a',
+      classId: 'class-a',
+      subject: 'EF06CI02',
+      questions: 10,
+      scheduledAt: '2026-05-03',
+      status: 'concluido',
+      corrected: 1,
+      participants: 1,
+      averageScore: 7,
+      triLevel: 'A',
+    })
+    data.evaluationCorrections.push({
+      ...correction('grade-ciencias-a', 'exam-ciencias-a', 'student-a', 'class-a', 'school-a'),
+      subject: 'EF06CI01',
+      finalScore: 7,
+    })
+    const liensina = new LiensinaService(new MemoryDatabase(data) as never, {} as never, { get: () => undefined } as never)
+
+    const page = liensina.listStudentSubjectCardsPage('student-user-a', 1, 10)
+    const cienciasCards = page.subjectCards.filter((card) => card.subject === 'Ciencias')
+    assert.equal(cienciasCards.length, 1)
+    assert.equal(cienciasCards[0].id, 'subject-ciencias')
+    assert.equal(cienciasCards[0].gradesCount, 1)
+    assert.equal(page.subjectCards.some((card) => card.subject === 'EF06CI01' || card.subject === 'EF06CI02'), false)
+
+    const searchPage = liensina.listStudentSubjectCardsPage('student-user-a', 1, 10, 'EF06CI02')
+    assert.deepEqual(searchPage.subjectCards.map((card) => card.subject), ['Ciencias'])
+  })
+
   it('professor gera prova apenas para turma/disciplina vinculada', async () => {
     const { liensina } = services()
 
@@ -305,6 +435,11 @@ describe('ResourceAccessService RBAC/ABAC', () => {
     assert.equal(Object.prototype.hasOwnProperty.call(correction, 'rawOmrResponse'), false)
     assert.equal(Object.prototype.hasOwnProperty.call(correction, 'detectedAnswers'), false)
     assert.equal(Object.prototype.hasOwnProperty.call(correction, 'answerKey'), false)
+
+    const detailedCorrectionsPayload = JSON.parse(JSON.stringify(access.listExamCorrections('student-user-a', { view: 'detail' })))
+    const detailedCorrection = detailedCorrectionsPayload.examCorrections[0]
+    assert.equal(detailedCorrection.answerKey[0].correctOption, 'A')
+    assert.equal(detailedCorrection.detectedAnswers[0].detectedOption, 'A')
 
     const studentLessonPayload = JSON.parse(JSON.stringify(access.listLessonRecords('student-user-a')))
     const studentLesson = studentLessonPayload.lessonRecords[0]
@@ -485,6 +620,11 @@ describe('ResourceAccessService RBAC/ABAC', () => {
       assert.equal(file.filename, 'cartao-a.jpg')
       assert.throws(() => liensina.getEvaluationCorrectionCardFile('teacher-user-a', 'grade-b'), /Correcao nao encontrada|Sem acesso/)
       assert.throws(() => liensina.getEvaluationCorrectionCardFile('student-user-a', 'grade-a'), /perfil/)
+
+      const studentFile = liensina.getStudentEvaluationCorrectionCardFile('student-user-a', 'grade-a')
+      assert.equal(studentFile.filePath, filePath)
+      assert.equal(studentFile.contentType, 'image/jpeg')
+      assert.throws(() => liensina.getStudentEvaluationCorrectionCardFile('student-user-a', 'grade-b'), /Correcao nao encontrada/)
     } finally {
       rmSync(filePath, { force: true })
     }

@@ -130,6 +130,24 @@ type SafeStoredFile = {
   sizeBytes: number
 }
 
+const CURRICULUM_COMPONENT_LABELS: Record<string, string> = {
+  AR: 'Arte',
+  CI: 'Ciencias',
+  EF: 'Educacao Fisica',
+  ER: 'Ensino Religioso',
+  ES: 'Lingua Espanhola',
+  GE: 'Geografia',
+  HI: 'Historia',
+  LI: 'Lingua Inglesa',
+  LP: 'Lingua Portuguesa',
+  MA: 'Matematica',
+  PV: 'Projeto de Vida',
+  CHS: 'Ciencias Humanas',
+  CNT: 'Ciencias da Natureza',
+  LGG: 'Linguagens',
+  MAT: 'Matematica',
+}
+
 function parseDurationSeconds(value: string | undefined, fallback: number) {
   const match = String(value ?? '').trim().match(/^(\d+)(s|m|h|d)?$/i)
   if (!match) return fallback
@@ -469,6 +487,135 @@ export class LiensinaService {
     return {
       subjectCards: page.items,
       pagination: page.pagination,
+    }
+  }
+
+  listStudentSubjectCardsPage(userId: string, rawPage: string | number = 1, rawLimit: string | number = 6, search = '') {
+    const data = this.readDataForQuery()
+    const actor = this.ensureCurrentUser(data, userId)
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (roleCode !== 'ALUNO') throw new ForbiddenException('Endpoint exclusivo do aluno.')
+
+    const scoped = this.getScopedSchoolsData(data, actor)
+    const student = scoped.students.find((item) => item.id === actor.linkedStudentId || item.userId === actor.id) ?? scoped.students[0]
+    const emptyPage = () => {
+      const page = this.paginate([], rawPage, rawLimit, 6)
+      return {
+        subjectCards: [],
+        pagination: page.pagination,
+        totals: { subjects: 0, grades: 0 },
+      }
+    }
+    if (!student) return emptyPage()
+
+    const classRoom = scoped.classes.find((item) => item.id === student.classId && item.schoolId === student.schoolId)
+    const allowedClassIds = new Set(scoped.classes.map((item) => item.id))
+    const evaluationsById = new Map(data.evaluations.map((evaluation) => [evaluation.id, evaluation]))
+    type StudentSubjectCard = {
+      id: string
+      subject: string
+      classRoom: ClassRoom | null
+      gradesCount: number
+      latestScore: number | null
+      bestScore: number | null
+      latestEvaluationTitle: string | null
+      updatedAt: string | null
+      searchText: string
+    }
+    const subjects = new Map<string, StudentSubjectCard>()
+    const addSubject = (subjectValue: unknown, targetClassRoom: ClassRoom | null = classRoom ?? null) => {
+      const rawSubject = String(subjectValue ?? '').trim()
+      if (!rawSubject) return null
+      const subject = this.getCanonicalAcademicSubjectLabel(rawSubject, data.curriculumSkills)
+      const key = this.normalizeTextKey(subject)
+      if (!key) return null
+      const current = subjects.get(key) ?? {
+        id: this.createStableSubjectId(subject),
+        subject,
+        classRoom: targetClassRoom,
+        gradesCount: 0,
+        latestScore: null,
+        bestScore: null,
+        latestEvaluationTitle: null,
+        updatedAt: null,
+        searchText: '',
+      }
+      if (!current.classRoom && targetClassRoom) current.classRoom = targetClassRoom
+      current.searchText = this.normalizeTextKey([
+        current.searchText,
+        rawSubject,
+        current.subject,
+        current.classRoom?.name,
+        current.classRoom?.grade,
+        current.classRoom?.shift,
+      ].filter(Boolean).join(' '))
+      subjects.set(key, current)
+      return current
+    }
+
+    const classSubjects = (classRoom?.bnccFocus ?? []).map((subject) => String(subject ?? '').trim()).filter(Boolean)
+    if (classSubjects.length) {
+      classSubjects.forEach((subject) => addSubject(subject))
+    } else {
+      for (const fallback of ['Matematica', 'Lingua Portuguesa', 'Historia', 'Geografia', 'Ciencias']) addSubject(fallback)
+    }
+
+    const confirmedCorrections = data.evaluationCorrections
+      .filter((correction) => (
+        correction.studentId === student.id
+        && correction.status === 'CONFIRMED'
+        && correction.finalScore != null
+        && allowedClassIds.has(correction.classId)
+        && (!correction.schoolId || correction.schoolId === student.schoolId)
+      ))
+      .sort((first, second) => {
+        const firstEvaluation = evaluationsById.get(first.evaluationId)
+        const secondEvaluation = evaluationsById.get(second.evaluationId)
+        const firstDate = firstEvaluation?.scheduledAt ?? first.reviewedAt ?? first.updatedAt
+        const secondDate = secondEvaluation?.scheduledAt ?? second.reviewedAt ?? second.updatedAt
+        return String(secondDate ?? '').localeCompare(String(firstDate ?? ''))
+      })
+
+    for (const correction of confirmedCorrections) {
+      const evaluation = evaluationsById.get(correction.evaluationId)
+      const subjectCard = addSubject(evaluation?.subject || correction.subject || 'Materia nao informada')
+      if (!subjectCard) continue
+      const score = Number(correction.finalScore)
+      const date = evaluation?.scheduledAt ?? correction.reviewedAt ?? correction.updatedAt ?? null
+      subjectCard.gradesCount += 1
+      subjectCard.bestScore = subjectCard.bestScore == null ? score : Math.max(subjectCard.bestScore, score)
+      if (!subjectCard.updatedAt || String(date ?? '').localeCompare(subjectCard.updatedAt) > 0) {
+        subjectCard.updatedAt = date
+        subjectCard.latestScore = score
+        subjectCard.latestEvaluationTitle = evaluation?.title ?? 'Prova corrigida'
+      }
+      subjectCard.searchText = this.normalizeTextKey([
+        subjectCard.searchText,
+        evaluation?.title,
+      ].filter(Boolean).join(' '))
+    }
+
+    const allCards = Array.from(subjects.values()).sort((first, second) => {
+      const firstWithGrades = first.gradesCount > 0 ? 0 : 1
+      const secondWithGrades = second.gradesCount > 0 ? 0 : 1
+      const dateOrder = String(second.updatedAt ?? '').localeCompare(String(first.updatedAt ?? ''))
+      return firstWithGrades - secondWithGrades || dateOrder || first.subject.localeCompare(second.subject, 'pt-BR')
+    })
+
+    const query = this.normalizeTextKey(search)
+    const filteredCards = query
+      ? allCards.filter((card) => card.searchText.includes(query))
+      : allCards
+    const page = this.paginate(filteredCards, rawPage, rawLimit, 6)
+    const subjectCards = page.items.map(({ searchText: _searchText, ...card }) => card)
+
+    return {
+      subjectCards,
+      pagination: page.pagination,
+      totals: {
+        subjects: allCards.length,
+        grades: confirmedCorrections.length,
+      },
     }
   }
 
@@ -1685,15 +1832,47 @@ export class LiensinaService {
       })
 
       evaluation = data.evaluations.find((item) => item.id === id) ?? evaluation
-      questions = this.resolveEvaluationQuestions(data, evaluation)
     }
 
     if (downloadKind === 'answer_cards') {
       data = this.ensureEvaluationAnswerCards(actorId, evaluation.id)
       evaluation = data.evaluations.find((item) => item.id === id) ?? evaluation
-      questions = this.resolveEvaluationQuestions(data, evaluation)
     }
 
+    return this.writeEvaluationDownloadFile(data, evaluation, downloadKind)
+  }
+
+  async getStudentEvaluationDownload(actorId: string, id: string, kind = 'complete'): Promise<EvaluationDownloadFile> {
+    const data = this.readDataForQuery()
+    const downloadKind = this.normalizeEvaluationDownloadKind(kind)
+    if (downloadKind === 'answer_cards') {
+      throw new ForbiddenException('Aluno nao pode baixar cartoes resposta da turma.')
+    }
+
+    const actor = this.ensureCurrentUser(data, actorId)
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (roleCode !== 'ALUNO') throw new ForbiddenException('Endpoint exclusivo do aluno.')
+
+    const scoped = this.getScopedSchoolsData(data, actor)
+    const studentIds = new Set(scoped.students.map((student) => student.id))
+    const classIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+    if (!studentIds.size) throw new NotFoundException('Aluno nao encontrado.')
+
+    const evaluation = data.evaluations.find((item) => item.id === id)
+    if (!evaluation || !classIds.has(evaluation.classId)) throw new NotFoundException('Prova nao encontrada.')
+
+    const ownConfirmedCorrection = data.evaluationCorrections.find((correction) => (
+      correction.evaluationId === evaluation.id
+      && correction.status === 'CONFIRMED'
+      && studentIds.has(correction.studentId)
+    ))
+    if (!ownConfirmedCorrection) throw new NotFoundException('Prova corrigida nao encontrada.')
+
+    return this.writeEvaluationDownloadFile(data, evaluation, downloadKind)
+  }
+
+  private async writeEvaluationDownloadFile(data: DatabaseShape, evaluation: Evaluation, downloadKind: EvaluationDownloadKind): Promise<EvaluationDownloadFile> {
+    const questions = this.resolveEvaluationQuestions(data, evaluation)
     const classRoom = data.classes.find((item) => item.id === evaluation.classId)
     const uploadsRoot = resolve(process.cwd(), 'uploads', 'public')
     const exportsDir = join(uploadsRoot, 'evaluations')
@@ -1784,6 +1963,28 @@ export class LiensinaService {
     const evaluation = data.evaluations.find((item) => item.id === correction.evaluationId)
     if (!evaluation) throw new NotFoundException('Prova da correcao nao encontrada.')
     if (!this.canAccessEvaluation(data, actor, evaluation)) throw new ForbiddenException('Sem acesso a esta correcao.')
+    return this.resolveEvaluationCorrectionCardFile(correction)
+  }
+
+  getStudentEvaluationCorrectionCardFile(actorId: string, correctionId: string): EvaluationDownloadFile {
+    const data = this.readDataForQuery()
+    const actor = this.ensureCurrentUser(data, actorId)
+    const roleCode = this.getCurrentRoleCode(data, actor)
+    if (roleCode !== 'ALUNO') throw new ForbiddenException('Endpoint exclusivo do aluno.')
+
+    const scoped = this.getScopedSchoolsData(data, actor)
+    const studentIds = new Set(scoped.students.map((student) => student.id))
+    const classIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+    const correction = data.evaluationCorrections.find((item) => item.id === correctionId)
+    if (!correction || correction.status !== 'CONFIRMED' || !studentIds.has(correction.studentId)) {
+      throw new NotFoundException('Correcao nao encontrada.')
+    }
+    const evaluation = data.evaluations.find((item) => item.id === correction.evaluationId)
+    if (!evaluation || !classIds.has(evaluation.classId)) throw new NotFoundException('Correcao nao encontrada.')
+    return this.resolveEvaluationCorrectionCardFile(correction)
+  }
+
+  private resolveEvaluationCorrectionCardFile(correction: EvaluationCorrection): EvaluationDownloadFile {
     const imageObject = correction.imageObject
     if (!imageObject || imageObject.storageProvider !== 'local') throw new NotFoundException('Arquivo da correcao nao encontrado.')
 
@@ -4187,6 +4388,55 @@ export class LiensinaService {
   private createStableSubjectId(subject: unknown) {
     const normalized = this.normalizeTextKey(subject).replace(/\s+/g, '-')
     return `subject-${normalized || 'geral'}`
+  }
+
+  private getCanonicalAcademicSubjectLabel(value: unknown, curriculumSkills: DatabaseShape['curriculumSkills'] = []) {
+    const raw = String(value ?? '').trim()
+    if (!raw) return ''
+
+    const normalized = this.normalizeTextKey(raw)
+    const skill = curriculumSkills.find((item) => (
+      this.normalizeTextKey(item.code) === normalized
+      || this.normalizeTextKey(item.id) === normalized
+    ))
+    const subjectLabel = skill?.component || this.getSubjectNameFromCurriculumCode(raw) || raw
+    return this.getOfficialAcademicSubjectLabel(subjectLabel) ?? this.getOfficialAcademicSubjectLabel(raw) ?? subjectLabel
+  }
+
+  private getSubjectNameFromCurriculumCode(value: unknown) {
+    const code = String(value ?? '').trim().toUpperCase()
+    const elementaryMatch = code.match(/^EF\d{2}([A-Z]{2})\d{2}[A-Z]?$/)
+    if (elementaryMatch?.[1]) return CURRICULUM_COMPONENT_LABELS[elementaryMatch[1]] ?? null
+
+    const highSchoolMatch = code.match(/^EM\d{2}([A-Z]{2,3})\d{2,3}[A-Z]?$/)
+    if (highSchoolMatch?.[1]) return CURRICULUM_COMPONENT_LABELS[highSchoolMatch[1]] ?? null
+
+    return null
+  }
+
+  private getOfficialAcademicSubjectLabel(value: unknown) {
+    const text = this.normalizeTextKey(value).replace(/[^a-z0-9]+/g, ' ').trim()
+    if (!text) return null
+    if (/(ciencias da natureza|natureza|ciencias humanas|humanas|linguagens)/.test(text)) return null
+    if (/(educacao fisica|ed fisica)/.test(text)) return 'Educacao Fisica'
+    if (/(lingua portuguesa|portugues|portuguesa|portugues brasil)/.test(text)) return 'Lingua Portuguesa'
+    if (/(lingua inglesa|ingles|inglesa|english)/.test(text)) return 'Lingua Inglesa'
+    if (/(lingua espanhola|espanhol|espanhola|espanol|spanish)/.test(text)) return 'Lingua Espanhola'
+    if (/(ensino religioso|religiao|religioso)/.test(text)) return 'Ensino Religioso'
+    if (/(projeto de vida|projeto vida)/.test(text)) return 'Projeto de Vida'
+    if (/literatura/.test(text)) return 'Literatura'
+    if (/redacao/.test(text)) return 'Redacao'
+    if (/matematica/.test(text)) return 'Matematica'
+    if (/biologia/.test(text)) return 'Biologia'
+    if (/(^|\s)fisica(\s|$)/.test(text)) return 'Fisica'
+    if (/quimica/.test(text)) return 'Quimica'
+    if (/historia/.test(text)) return 'Historia'
+    if (/geografia/.test(text)) return 'Geografia'
+    if (/filosofia/.test(text)) return 'Filosofia'
+    if (/sociologia/.test(text)) return 'Sociologia'
+    if (/ciencias/.test(text)) return 'Ciencias'
+    if (/(^|\s)arte(s)?(\s|$)/.test(text)) return 'Arte'
+    return null
   }
 
   private async runIdempotentOperation<T>(

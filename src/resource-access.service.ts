@@ -1288,6 +1288,13 @@ export class ResourceAccessService {
     } as unknown as EvaluationCorrection
 
     if (roleCode !== 'ALUNO' && roleCode !== 'RESPONSAVEL') return safeCorrection
+    if (roleCode === 'ALUNO' && view === 'detail') {
+      return {
+        ...safeCorrection,
+        hasImage: undefined,
+        teacherNotes: correction.teacherNotes ?? null,
+      } as unknown as EvaluationCorrection
+    }
     return {
       ...safeCorrection,
       hasImage: undefined,

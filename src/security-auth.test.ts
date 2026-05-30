@@ -270,6 +270,32 @@ describe('JWT refresh sessions', () => {
 })
 
 describe('PostgreSQL tenant integrity', () => {
+  it('permite questoes globais sem escola real sem liberar questoes escolares invalidas', () => {
+    const database = new DatabaseService(new MemoryConfig({}) as never) as unknown as TenantIntegrityHarness
+
+    const globalData = makeDatabase()
+    globalData.questions.push({
+      id: 'question-global',
+      schoolId: 'global-school',
+      visibility: 'GLOBAL',
+      sourceType: 'GLOBAL_CURATED',
+      createdById: 'system-liensina',
+    } as never)
+
+    assert.doesNotThrow(() => database.assertTenantIntegrity(globalData, database.buildTenantLookup(globalData)))
+
+    const privateData = makeDatabase()
+    privateData.questions.push({
+      id: 'question-private',
+      schoolId: 'global-school',
+      visibility: 'PRIVATE',
+      sourceType: 'TEACHER_CREATED',
+      createdById: 'teacher-user',
+    } as never)
+
+    assert.throws(() => database.assertTenantIntegrity(privateData, database.buildTenantLookup(privateData)), /Violacao de tenant/)
+  })
+
   it('bloqueia persistencia relacional com vinculo cruzado entre escolas', () => {
     const data = makeDatabase()
     data.schools.push(
