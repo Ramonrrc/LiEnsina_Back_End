@@ -257,8 +257,13 @@ export class AppController {
 
   @UseGuards(AuthGuard)
   @Get('me/teacher-subjects')
-  listMyTeacherSubjects(@Req() request: RequestWithUser, @Query('page') page = '1', @Query('limit') limit = '6') {
-    return this.liensinaService.listTeacherSubjectCardsPage(request.user!.id, page, limit)
+  listMyTeacherSubjects(
+    @Req() request: RequestWithUser,
+    @Query('page') page = '1',
+    @Query('limit') limit = '6',
+    @Query('search') search = '',
+  ) {
+    return this.liensinaService.listTeacherSubjectCardsPage(request.user!.id, page, limit, search)
   }
 
   @UseGuards(AuthGuard)
@@ -417,8 +422,13 @@ export class AppController {
 
   @UseGuards(AuthGuard)
   @Get('teacher-subjects')
-  listTeacherSubjects(@Req() request: RequestWithUser, @Query('page') page = '1', @Query('limit') limit = '6') {
-    return this.liensinaService.listTeacherSubjectCardsPage(request.user!.id, page, limit)
+  listTeacherSubjects(
+    @Req() request: RequestWithUser,
+    @Query('page') page = '1',
+    @Query('limit') limit = '6',
+    @Query('search') search = '',
+  ) {
+    return this.liensinaService.listTeacherSubjectCardsPage(request.user!.id, page, limit, search)
   }
 
   @UseGuards(AuthGuard)

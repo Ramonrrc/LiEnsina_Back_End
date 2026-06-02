@@ -67,6 +67,10 @@ export class ResourceListQueryDto extends PaginationQueryDto {
   role?: string
 
   @IsOptional()
+  @IsIn(['planejado', 'em_aplicacao', 'corrigindo', 'concluido', 'all'])
+  examStatus?: string
+
+  @IsOptional()
   @IsString()
   view?: string
 

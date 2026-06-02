@@ -2,6 +2,7 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException,
 import { randomUUID } from 'node:crypto'
 
 import { DatabaseService } from './database.service'
+import { normalizeRoleCode } from './role-utils'
 import type {
   AppNotification,
   ClassRoom,
@@ -179,6 +180,10 @@ const roleActions: Record<RoleCode, string[]> = {
 
 function isSuperAdminRole(roleCode: RoleCode) {
   return roleCode === 'SUPERADMIN'
+}
+
+function isNetworkAdminRole(roleCode: RoleCode) {
+  return roleCode === 'SUPERADMIN' || roleCode === 'ADMIN'
 }
 
 function isSchoolAdminRole(roleCode: RoleCode) {
@@ -1053,7 +1058,7 @@ export class ResourceAccessService {
       .filter((student) => student.id === actor.linkedStudentId || student.userId === actor.id)
       .map((student) => student.id))
 
-    if (isSuperAdminRole(roleCode)) return this.scopeFromResources(data, data.schools, data.classes, data.teachers, data.guardians, data.students)
+    if (isNetworkAdminRole(roleCode)) return this.scopeFromResources(data, data.schools, data.classes, data.teachers, data.guardians, data.students)
 
     if (isSchoolManagementRole(roleCode)) {
       const schools = data.schools.filter((school) => actor.schoolId === school.id)
@@ -1143,7 +1148,7 @@ export class ResourceAccessService {
 
   private getRoleCode(data: { roles: Role[] }, user: UserAccount): RoleCode {
     const role = data.roles.find((item) => item.id === user.roleId)
-    return role?.code ?? role?.name ?? 'ALUNO'
+    return normalizeRoleCode(role?.code, role?.name, user.roleId) ?? 'ALUNO'
   }
 
   private ensureAllowedId(allowedIds: Set<string>, id: string, resourceLabel: string) {
@@ -1369,6 +1374,7 @@ export class ResourceAccessService {
     const classFilter = this.cleanFilter(query.classId)
     const teacherFilter = this.cleanFilter(query.teacherId)
     const subjectFilter = this.cleanFilter(query.subject ?? query.subjectId)
+    const examStatusFilter = this.cleanFilter(query.examStatus)
 
     if (schoolFilter) {
       this.ensureAllowedId(context.scope.schoolIds, schoolFilter, 'escola')
@@ -1383,6 +1389,7 @@ export class ResourceAccessService {
       exams = exams.filter((exam) => exam.teacherId === teacherFilter || exam.createdById === teacherFilter)
     }
     if (subjectFilter) exams = exams.filter((exam) => this.subjectMatches(exam.subject, subjectFilter))
+    if (examStatusFilter) exams = exams.filter((exam) => exam.status === examStatusFilter)
     return this.searchItems(exams, query.search, (exam) => `${exam.title} ${exam.subject}`)
   }
 
@@ -1392,7 +1399,7 @@ export class ResourceAccessService {
     if (schoolId && !context.scope.schoolIds.has(schoolId)) return false
     if (!context.scope.classIds.has(evaluation.classId)) return false
     if (context.roleCode === 'PROFESSOR') return this.teacherCanReadExam(context, evaluation)
-    return ['DIRETOR', 'COORDENADOR', 'ALUNO', 'RESPONSAVEL'].includes(context.roleCode)
+    return isSchoolManagementRole(context.roleCode) || ['ALUNO', 'RESPONSAVEL'].includes(context.roleCode)
   }
 
   private canWriteExam(context: AccessContext, evaluation: Evaluation) {

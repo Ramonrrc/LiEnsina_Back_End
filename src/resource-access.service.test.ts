@@ -123,13 +123,21 @@ function correction(id: string, evaluationId: string, studentId: string, classId
 }
 
 function makeDatabase(): DatabaseShape {
-  const roles = ['SUPERADMIN', 'ADMIN', 'ADMIN_ESCOLA', 'DIRETOR', 'COORDENADOR', 'PROFESSOR', 'ALUNO', 'RESPONSAVEL', 'NUTRITIONIST'].map((code) => role(code as RoleCode))
+  const roles: DatabaseShape['roles'] = ['SUPERADMIN', 'ADMIN', 'ADMIN_ESCOLA', 'DIRETOR', 'COORDENADOR', 'PROFESSOR', 'ALUNO', 'RESPONSAVEL', 'NUTRITIONIST'].map((code) => role(code as RoleCode))
+  roles.push({
+    id: 'legacy-admin-role',
+    code: 'Administrador' as RoleCode,
+    name: 'Administrador' as RoleCode,
+    description: 'Administrador da rede',
+    permissions: [],
+  })
 
   return {
     roles,
     users: [
       { id: 'superadmin-user', name: 'Superadmin', email: 'superadmin@local', login: 'superadmin@local', password: 'secret', roleId: 'SUPERADMIN', schoolId: null, status: 'ativo', phone: '' },
       { id: 'admin-user', name: 'Admin', email: 'admin@local', login: 'admin@local', password: 'secret', roleId: 'ADMIN', schoolId: null, status: 'ativo', phone: '' },
+      { id: 'legacy-admin-user', name: 'Admin legado', email: 'admin.legado@local', login: 'admin.legado@local', password: 'secret', roleId: 'legacy-admin-role', schoolId: null, status: 'ativo', phone: '' },
       { id: 'school-admin-user-a', name: 'Admin Escola A', email: 'admin.a@local', login: 'admin.a@local', password: 'secret', roleId: 'ADMIN_ESCOLA', schoolId: 'school-a', status: 'ativo', phone: '' },
       { id: 'school-admin-user-b', name: 'Admin Escola B', email: 'admin.b@local', login: 'admin.b@local', password: 'secret', roleId: 'ADMIN_ESCOLA', schoolId: 'school-b', status: 'ativo', phone: '' },
       { id: 'director-user-a', name: 'Diretor A', email: 'diretor.a@local', login: 'diretor.a@local', password: 'secret', roleId: 'DIRETOR', schoolId: 'school-a', status: 'ativo', phone: '' },
@@ -244,9 +252,16 @@ describe('ResourceAccessService RBAC/ABAC', () => {
 
     const page = liensina.listTeacherSubjectCardsPage('teacher-user-a', 1, 6)
 
-    assert.ok(page.subjectCards.length > 1)
+    assert.ok(page.subjectCards.length >= 1)
     assert.match(page.subjectCards[0].subject, /matem/i)
     assert.deepEqual(page.subjectCards[0].classes.map((classRoom) => classRoom.id), ['class-a'])
+    assert.deepEqual(page.subjectCards[0].lessons.map((lesson) => lesson.id), ['lesson-a'])
+    assert.equal(page.totals.classes, 1)
+    assert.equal(page.totals.lessons, 1)
+
+    const historySearch = liensina.listTeacherSubjectCardsPage('teacher-user-a', 1, 6, 'lista')
+    assert.deepEqual(historySearch.subjectCards.map((card) => card.subject), ['Matematica'])
+    assert.deepEqual(historySearch.subjectCards[0].lessons.map((lesson) => lesson.id), ['lesson-a'])
   })
 
   it('endpoint de minhas materias do aluno pagina e busca no banco sem vazar outra escola', () => {
@@ -514,15 +529,33 @@ describe('ResourceAccessService RBAC/ABAC', () => {
     assert.equal(access.listSchools('superadmin-user').schools.length, 2)
   })
 
-  it('admin sem escola nao herda acesso global de superadmin', () => {
+  it('admin acessa recursos academicos globais sem herdar permissoes sensiveis de superadmin', () => {
     const { access, liensina } = services()
 
-    assert.deepEqual(access.listStudents('admin-user').students, [])
-    assert.deepEqual(access.listTeachers('admin-user').teachers, [])
-    assert.deepEqual(access.listExams('admin-user').exams, [])
-    assert.deepEqual(access.listSchools('admin-user').schools, [])
+    assert.deepEqual(access.listSchools('admin-user').schools.map((school) => school.id), ['school-a', 'school-b'])
+    assert.deepEqual(access.listClasses('admin-user', { schoolId: 'school-a' }).classes.map((classRoom) => classRoom.id), ['class-a'])
+    assert.deepEqual(access.listStudents('admin-user').students.map((student) => student.id), ['student-a', 'student-b'])
+    assert.deepEqual(access.listStudents('admin-user', { schoolId: 'school-a' }).students.map((student) => student.id), ['student-a'])
+    assert.deepEqual(access.listTeachers('admin-user').teachers.map((teacher) => teacher.id), ['teacher-a', 'teacher-b'])
+    assert.deepEqual(access.listTeachers('admin-user', { schoolId: 'school-a' }).teachers.map((teacher) => teacher.id), ['teacher-a'])
+    assert.deepEqual(access.listExams('admin-user').exams.map((exam) => exam.id), ['exam-a', 'exam-b'])
+    assert.deepEqual(access.listExams('admin-user', { schoolId: 'school-a' }).exams.map((exam) => exam.id), ['exam-a'])
+    assert.deepEqual(access.listExams('admin-user', { search: 'historia' }).exams.map((exam) => exam.id), ['exam-b'])
+    assert.deepEqual(access.listExams('admin-user', { page: 1, limit: 1 }).pagination, { page: 1, limit: 1, total: 2, totalPages: 2 })
+    assert.deepEqual(access.listExams('admin-user', { examStatus: 'planejado', search: 'Prova B' }).exams.map((exam) => exam.id), ['exam-b'])
     assert.deepEqual(access.listRoles('admin-user').roles.map((item) => item.code), ['ADMIN'])
     assert.throws(() => liensina.updateUserRole('admin-user', 'student-user-a', 'SUPERADMIN'), /permissao/)
+  })
+
+  it('admin com cargo legado por nome tambem recebe escolas no REST e no dashboard', () => {
+    const { access, liensina } = services()
+
+    assert.deepEqual(access.listSchools('legacy-admin-user').schools.map((school) => school.id), ['school-a', 'school-b'])
+    assert.deepEqual(access.listTeachers('legacy-admin-user').teachers.map((teacher) => teacher.id), ['teacher-a', 'teacher-b'])
+    assert.deepEqual(access.listStudents('legacy-admin-user').students.map((student) => student.id), ['student-a', 'student-b'])
+    assert.deepEqual(access.listExams('legacy-admin-user').exams.map((exam) => exam.id), ['exam-a', 'exam-b'])
+    assert.equal(liensina.getSchoolsScreen('legacy-admin-user').schools.length, 2)
+    assert.equal(liensina.getDashboardScreen('legacy-admin-user').dashboard.metrics.find((metric) => metric.id === 'schools')?.value, '2')
   })
 
   it('admin escolar fica limitado a propria escola e nao executa rotas globais', () => {

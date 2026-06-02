@@ -12,6 +12,7 @@ import sharp from 'sharp'
 import { DatabaseService } from './database.service'
 import { writeEvaluationAnswerCardsPdfFile, writeEvaluationAnswerKeyPdfFile, writeEvaluationPdfFile } from './evaluation-pdf'
 import { EvaluationAnswerCardCreationService, EvaluationQrCodeService } from './evaluation-answer-card.services'
+import { normalizeRoleCode } from './role-utils'
 import type { AddMealFoodRequestToStockPayload, AppNotification, AssessmentDescriptor, AssessmentMatrix, AssessmentProgram, CalendarEventType, ClassRoom, CreateMealFoodPayload, CreateMealFoodRequestPayload, CreateMealItemPayload, CreateMealManagementPayload, CreateQuestionRequest, DatabaseShape, Difficulty, EducationStage, Evaluation, EvaluationAnswerCard, EvaluationAnswerKeyItem, EvaluationBuildMode, EvaluationCorrection, EvaluationCorrectionDetectedAnswer, EvaluationCorrectionReviewPayload, FoodRequestStatus, GenerateEnemQuestionsRequest, GenerateEnemQuestionsResponse, GenerateQuestionSelectionRequest, GenerateQuestionSelectionResponse, Guardian, JwtPayload, LessonRecord, MealFood, MealFoodRequest, MealManagement, MealMenu, MealMenuStatus, MealRequestHistory, MealRequestHistoryAction, MealShift, MealStockStatus, MealType, MealUnit, NotificationsScreenPayload, PublicUserAccount, Question, QuestionDescriptorSummary, QuestionSourceType, QuestionStatus, QuestionType, QuestionVisibility, RefreshSession, ReviewMealFoodRequestPayload, Role, RoleCode, RoomReservation, School, SchoolCalendarEvent, StoredImageObject, Student, Teacher, UpdateMealBudgetPayload, UpdateMealFoodRequestPayload, UpsertMealMenuPayload, UserAccount } from './liensina.types'
 
 type ProfileImageFile = {
@@ -450,43 +451,111 @@ export class LiensinaService {
     }
   }
 
-  listTeacherSubjectCardsPage(userId: string, rawPage: string | number = 1, rawLimit: string | number = 6) {
+  listTeacherSubjectCardsPage(userId: string, rawPage: string | number = 1, rawLimit: string | number = 6, search = '') {
     const data = this.readDataForQuery()
     const actor = this.ensureCurrentUser(data, userId)
     const scoped = this.getScopedSchoolsData(data, actor)
-    const subjects = new Map<string, { subject: string; classes: ClassRoom[] }>()
-    const addSubject = (subject: string, classRoom?: ClassRoom) => {
-      const cleanSubject = String(subject ?? '').trim()
-      if (!cleanSubject) return
-      const key = this.normalizeTextKey(cleanSubject)
-      const current = subjects.get(key) ?? { subject: cleanSubject, classes: [] }
-      if (classRoom && !current.classes.some((item) => item.id === classRoom.id)) current.classes.push(classRoom)
-      subjects.set(key, current)
+    type TeacherSubjectCard = {
+      id: string
+      subject: string
+      classes: ClassRoom[]
+      lessons: LessonRecord[]
+      searchText: string
     }
+    const subjects = new Map<string, TeacherSubjectCard>()
+    const classById = new Map(scoped.classes.map((classRoom) => [classRoom.id, classRoom]))
+    const scopedClassIds = new Set(scoped.classes.map((classRoom) => classRoom.id))
+    const addSubject = (subjectValue: unknown, classRoom?: ClassRoom | null) => {
+      const rawSubject = String(subjectValue ?? '').trim()
+      if (!rawSubject) return null
+      const subject = this.getCanonicalAcademicSubjectLabel(rawSubject, data.curriculumSkills)
+      const key = this.normalizeTextKey(subject)
+      if (!key) return null
+      const current = subjects.get(key) ?? {
+        id: this.createStableSubjectId(subject),
+        subject,
+        classes: [],
+        lessons: [],
+        searchText: '',
+      }
+      if (classRoom && !current.classes.some((item) => item.id === classRoom.id)) current.classes.push(classRoom)
+      current.searchText = this.normalizeTextKey([
+        current.searchText,
+        rawSubject,
+        current.subject,
+        classRoom?.name,
+        classRoom?.grade,
+        classRoom?.shift,
+        classRoom?.schedule,
+      ].filter(Boolean).join(' '))
+      subjects.set(key, current)
+      return current
+    }
+
+    for (const teacher of scoped.teachers) addSubject(teacher.specialty)
 
     for (const classRoom of scoped.classes) {
       for (const focus of classRoom.bnccFocus ?? []) addSubject(focus, classRoom)
-      if (!(classRoom.bnccFocus ?? []).length) addSubject(classRoom.grade, classRoom)
+      if (!(classRoom.bnccFocus ?? []).length) {
+        for (const fallback of ['Matematica', 'Lingua Portuguesa', 'Historia', 'Geografia', 'Ciencias']) {
+          addSubject(fallback, classRoom)
+        }
+      }
     }
 
-    for (const fallback of ['Matematica', 'Lingua Portuguesa', 'Historia', 'Geografia', 'Ciencias']) addSubject(fallback)
+    const lessonRecords = data.lessonRecords
+      .filter((record) => scopedClassIds.has(record.classId))
+      .sort((first, second) => {
+        const dateOrder = `${second.date} ${second.time}`.localeCompare(`${first.date} ${first.time}`)
+        return dateOrder || second.id.localeCompare(first.id)
+      })
 
-    const cards = Array.from(subjects.values())
+    for (const lesson of lessonRecords) {
+      const subjectCard = addSubject(lesson.subject, classById.get(lesson.classId))
+      if (!subjectCard) continue
+      if (!subjectCard.lessons.some((item) => item.id === lesson.id)) subjectCard.lessons.push(lesson)
+      subjectCard.searchText = this.normalizeTextKey([
+        subjectCard.searchText,
+        lesson.content,
+        lesson.plan,
+        lesson.resources,
+        lesson.activity,
+        lesson.notes,
+        lesson.date,
+        lesson.time,
+      ].filter(Boolean).join(' '))
+    }
+
+    if (!subjects.size) {
+      for (const fallback of ['Matematica', 'Lingua Portuguesa', 'Historia', 'Geografia', 'Ciencias']) addSubject(fallback)
+    }
+
+    const allCards = Array.from(subjects.values())
       .sort((first, second) => {
         const firstLinked = first.classes.length > 0 ? 0 : 1
         const secondLinked = second.classes.length > 0 ? 0 : 1
-        return firstLinked - secondLinked || first.subject.localeCompare(second.subject)
+        return (
+          firstLinked - secondLinked ||
+          second.classes.length - first.classes.length ||
+          second.lessons.length - first.lessons.length ||
+          first.subject.localeCompare(second.subject, 'pt-BR')
+        )
       })
-      .map((item) => ({
-        id: this.createStableSubjectId(item.subject),
-        subject: item.subject,
-        classes: item.classes,
-      }))
-    const page = this.paginate(cards, rawPage, rawLimit, 6)
+    const query = this.normalizeTextKey(search)
+    const filteredCards = query
+      ? allCards.filter((card) => card.searchText.includes(query))
+      : allCards
+    const page = this.paginate(filteredCards, rawPage, rawLimit, 6)
+    const subjectCards = page.items.map(({ searchText: _searchText, ...card }) => card)
 
     return {
-      subjectCards: page.items,
+      subjectCards,
       pagination: page.pagination,
+      totals: {
+        subjects: allCards.length,
+        classes: scoped.classes.length,
+        lessons: lessonRecords.length,
+      },
     }
   }
 
@@ -2857,9 +2926,8 @@ export class LiensinaService {
 
     this.database.update((data) => {
       const currentUser = this.ensureCurrentUser(data, actorId)
-      const roleCode = data.roles.find((role) => role.id === currentUser.roleId)?.code
-        ?? data.roles.find((role) => role.id === currentUser.roleId)?.name
-      if (!['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(String(roleCode ?? ''))) {
+      const roleCode = this.getCurrentRoleCode(data, currentUser)
+      if (!['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) {
         throw new ForbiddenException('Seu perfil nao pode registrar aulas.')
       }
 
@@ -2883,9 +2951,8 @@ export class LiensinaService {
 
     this.database.update((data) => {
       const currentUser = this.ensureCurrentUser(data, actorId)
-      const roleCode = data.roles.find((role) => role.id === currentUser.roleId)?.code
-        ?? data.roles.find((role) => role.id === currentUser.roleId)?.name
-      if (!['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(String(roleCode ?? ''))) {
+      const roleCode = this.getCurrentRoleCode(data, currentUser)
+      if (!['ADMIN', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) {
         throw new ForbiddenException('Seu perfil nao pode atualizar registros de aula.')
       }
 
@@ -3973,8 +4040,7 @@ export class LiensinaService {
     const studentsWithVisuals = data.students.map((student) => this.withLinkedUserVisualsFromIndex(student, userVisualIndex))
     const teachersWithVisuals = data.teachers.map((teacher) => this.withLinkedUserVisualsFromIndex(teacher, userVisualIndex))
     const guardiansWithVisuals = data.guardians.map((guardian) => this.withLinkedUserVisualsFromIndex(guardian, userVisualIndex))
-    const role = data.roles.find((item) => item.id === currentUser.roleId)
-    const roleCode = role?.code ?? role?.name
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
 
     if (roleCode === 'SUPERADMIN' || roleCode === 'ADMIN') {
       return {
@@ -4262,8 +4328,7 @@ export class LiensinaService {
 
   private ensureRole(data: { users: UserAccount[]; roles: Role[] }, userId: string, code: RoleCode) {
     const currentUser = this.ensureCurrentUser(data, userId)
-    const role = data.roles.find((item) => item.id === currentUser.roleId)
-    const roleCode = role?.code ?? role?.name
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
     if (code === 'ADMIN' && roleCode && this.isSuperAdminRole(roleCode)) return currentUser
     if (roleCode !== code) {
       throw new ForbiddenException('Apenas administradores podem registrar compras da merenda.')
@@ -4273,7 +4338,7 @@ export class LiensinaService {
 
   private getCurrentRoleCode(data: { roles: Role[] }, currentUser: UserAccount): RoleCode {
     const role = data.roles.find((item) => item.id === currentUser.roleId)
-    const roleCode = role?.code ?? role?.name
+    const roleCode = normalizeRoleCode(role?.code, role?.name, currentUser.roleId)
     if (!roleCode || !validRoleCodes.has(roleCode)) {
       throw new ForbiddenException('Cargo do usuario invalido ou nao configurado.')
     }
@@ -4501,9 +4566,8 @@ export class LiensinaService {
 
   private ensureCalendarEventMutationAllowed(data: { users: UserAccount[]; roles: Role[] }, actorId: string, event: SchoolCalendarEvent) {
     const currentUser = this.ensureCurrentUser(data, actorId)
-    const role = data.roles.find((item) => item.id === currentUser.roleId)
-    const roleCode = role?.code ?? role?.name
-    if (roleCode && this.isSuperAdminRole(roleCode)) return
+    const roleCode = this.getCurrentRoleCode(data, currentUser)
+    if (this.isSuperAdminRole(roleCode)) return
     if (event.createdById && event.createdById === currentUser.id) return
     throw new ForbiddenException('Apenas o criador do evento ou um Admin pode alterar este evento.')
   }
@@ -4689,7 +4753,7 @@ export class LiensinaService {
   private canAccessEvaluation(data: DatabaseShape, actor: UserAccount, evaluation: Evaluation) {
     const roleCode = this.getCurrentRoleCode(data, actor)
     if (this.isSuperAdminRole(roleCode)) return true
-    if (!['ADMIN_ESCOLA', 'DIRETOR', 'COORDENADOR', 'PROFESSOR'].includes(roleCode)) return false
+    if (!this.isSchoolManagementRole(roleCode) && roleCode !== 'PROFESSOR') return false
 
     const scoped = this.getScopedSchoolsData(data, actor)
     return scoped.classes.some((classRoom) => classRoom.id === evaluation.classId)
