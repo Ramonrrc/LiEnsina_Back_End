@@ -9,6 +9,8 @@
     "start": "npm run build && node dist/main.js",
     "start:dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "db:snapshot:local": "node scripts/create-local-snapshot.mjs",
+    "db:dump:postgres": "node scripts/dump-postgres.mjs",
+    "db:restore:postgres": "node scripts/restore-postgres-dump.mjs",
     "db:migrate:postgres": "node scripts/migrate-local-store-to-postgres.mjs",
     "db:verify:postgres": "node scripts/verify-postgres-migration.mjs",
     "db:restore:local": "node scripts/restore-local-store.mjs",

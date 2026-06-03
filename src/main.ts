@@ -39,6 +39,19 @@ function isAllowedDevOrigin(origin: string) {
   }
 }
 
+function isStateChangingApiRequest(request: Request) {
+  return request.path.startsWith('/api/') && ['POST', 'PATCH', 'DELETE', 'PUT'].includes(request.method.toUpperCase())
+}
+
+function getOriginFromReferer(referer: string | undefined) {
+  if (!referer) return undefined
+  try {
+    return new URL(referer).origin
+  } catch {
+    return undefined
+  }
+}
+
 async function bootstrap() {
   const app = await NestFactory.create(AppModule)
   const config = app.get(ConfigService)
@@ -64,7 +77,8 @@ async function bootstrap() {
     fallthrough: false,
     setHeaders: (response) => {
       response.setHeader('X-Content-Type-Options', 'nosniff')
-      response.setHeader('Cache-Control', 'public, max-age=3600')
+      response.setHeader('Cache-Control', 'private, no-store')
+      response.setHeader('Cross-Origin-Resource-Policy', 'same-origin')
     },
   }))
   app.enableCors({
@@ -79,6 +93,18 @@ async function bootstrap() {
     },
     credentials: true,
     exposedHeaders: ['Content-Disposition'],
+  })
+  app.use((request: Request, response: Response, next: NextFunction) => {
+    if (!isStateChangingApiRequest(request)) return next()
+    if (request.headers['x-liensina-csrf'] !== '1') {
+      return response.status(403).json({ message: 'Cabecalho CSRF obrigatorio.' })
+    }
+
+    const origin = request.headers.origin ?? getOriginFromReferer(request.headers.referer)
+    if (!origin || allowedOrigins.has(String(origin)) || isAllowedDevOrigin(String(origin))) return next()
+
+    corsLogger.warn(`Origem mutavel bloqueada por CSRF: ${String(origin).slice(0, 200)}`)
+    return response.status(403).json({ message: 'Origem nao autorizada.' })
   })
   app.setGlobalPrefix('api')
 

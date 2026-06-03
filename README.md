@@ -35,6 +35,24 @@ Variaveis principais:
 - `DATABASE_SSL=true` ou `require` para Neon.
 - `DATABASE_PATH=data/liensina.sqlite` para o SQLite legado.
 
+## Dump PostgreSQL
+
+Com o Postgres do Docker em execucao, gere um dump local em formato custom do `pg_dump`:
+
+```bash
+npm run db:dump:postgres
+```
+
+Por padrao o arquivo fica fora do repositorio, em `../Backups_LiEnsina/postgres/` a partir da pasta raiz do projeto, junto de um manifesto `.json`. Para escolher outro destino, defina `POSTGRES_DUMP_DIR`.
+
+Para restaurar conscientemente um dump no Postgres local:
+
+```bash
+npm run db:restore:postgres -- ../Backups_LiEnsina/postgres/liensina-postgres-ARQUIVO.dump
+```
+
+Se houver mais de um container Postgres rodando, defina `POSTGRES_CONTAINER=nome-do-container` antes do comando.
+
 ## Migracao SQLite -> PostgreSQL
 
 1. Garanta que o backend esteja parado para congelar escritas no SQLite.

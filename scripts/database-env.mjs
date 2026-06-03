@@ -1,8 +1,23 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-export function loadEnvFile(filePath = '.env') {
-  const absolutePath = resolve(process.cwd(), filePath)
+export function loadEnvFile(filePath) {
+  const scriptDir = dirname(fileURLToPath(import.meta.url))
+  const candidatePaths = filePath
+    ? [resolve(process.cwd(), filePath)]
+    : [
+        resolve(process.cwd(), '.env'),
+        resolve(scriptDir, '..', '.env'),
+        resolve(scriptDir, '..', '..', '.env'),
+      ]
+
+  for (const absolutePath of candidatePaths) {
+    loadSingleEnvFile(absolutePath)
+  }
+}
+
+function loadSingleEnvFile(absolutePath) {
   if (!existsSync(absolutePath)) return
 
   const content = readFileSync(absolutePath, 'utf8')
